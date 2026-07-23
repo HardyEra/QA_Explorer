@@ -3,3 +3,5 @@ groq
 python-dotenv
 openai
 pydantic
+google-genai
+langgraph

@@ -203,6 +203,10 @@ class PageExtractor:
             for element in self.page.locator(selector).all():
 
                 try:
+                    # Do not plan clicks on hidden menu entries, modals, or
+                    # duplicate controls. They cannot be interacted with yet.
+                    if not element.is_visible():
+                        continue
 
                     text = self._safe_text(element)
 

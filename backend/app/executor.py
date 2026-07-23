@@ -9,10 +9,12 @@ class Executor:
             print(step)
 
             if step["type"] == "fill":
-                self.browser.fill_input(
+                success = self.browser.fill_input(
                     step["target"],
                     step["value"]
                 )
+                if not success:
+                    return False
 
             elif step["type"] == "click":
 

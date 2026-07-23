@@ -10,10 +10,14 @@ class ExplorationConfig:
 
     def __init__(self,
                  start_url,
-                 follow_external=False):
+                 follow_external=False,
+                 explore_new_tabs=False,
+                 max_steps=100):
 
         self.start_url = start_url
         self.follow_external = follow_external
+        self.explore_new_tabs = explore_new_tabs
+        self.max_steps = max_steps
 
         self.base_domain = urlparse(start_url).netloc
 
