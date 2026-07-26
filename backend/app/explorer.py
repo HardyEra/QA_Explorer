@@ -93,7 +93,11 @@ class Explorer:
             self._action_route,
             {"plan": "plan", "complete": END},
         )
-        workflow.add_edge("plan", "execute")
+        workflow.add_conditional_edges(
+            "plan",
+            self._plan_route,
+            {"execute": "execute", "complete": END},
+        )
         workflow.add_edge("execute", "record_result")
         workflow.add_edge("record_result", "observe")
 
@@ -161,7 +165,10 @@ class Explorer:
         available_actions = [
             action
             for action in observation.actions
-            if not self.memory.has_executed_action(observation.page.url, action.id)
+            if not self.memory.has_executed_action(
+                observation.page.url,
+                self._action_memory_key(action),
+            )
         ]
         logger.info(
             "Selected %s unexplored actions on %s",
@@ -175,6 +182,18 @@ class Explorer:
         print("==========================")
         return {"available_actions": available_actions}
 
+    @staticmethod
+    def _action_memory_key(action) -> str:
+        """Keep exploration memory stable when a page reorders DOM controls.
+
+        ``ActionRegistry`` ids intentionally reset for every observation.
+        Persisting those transient ids made an action at a new DOM position look
+        unexplored, and could also hide a different action that inherited the
+        old id. A visible label plus action type is stable across observations.
+        """
+        label = " ".join(str(getattr(action, "text", "")).casefold().split())
+        return f"{getattr(action, 'type', 'unknown')}::{label}"
+
     def _action_route(self, state: ExplorationState) -> Literal["plan", "complete"]:
         if state["iterations"] >= self.config.max_steps:
             logger.info("Stopping after configured maximum of %s observations", self.config.max_steps)
@@ -185,6 +204,12 @@ class Explorer:
             print("\n[OK] Exploration complete.")
             return "complete"
         return "plan"
+
+    def _plan_route(self, state: ExplorationState) -> Literal["execute", "complete"]:
+        if state.get("plan", {}).get("steps"):
+            return "execute"
+        logger.info("Exploration complete; planner has no safe workflow action to execute")
+        return "complete"
 
     def _prepare_candidates(self, state: ExplorationState) -> dict[str, Any]:
         """Prepare planner candidates in one graph superstep.
@@ -268,13 +293,14 @@ class Explorer:
         page_url = state["source_url"]
         page = state["observation"].page
         action_targets = {
-            action.id: action.text for action in state["planner_candidates"]
+            action.id: action for action in state["planner_candidates"]
         }
         for step in state["plan"].get("steps", []):
             action_type = step.get("type")
             target = step.get("target")
             if action_type == "click":
-                target = action_targets.get(step.get("action_id"), target)
+                action = action_targets.get(step.get("action_id"))
+                target = action.text if action else target
 
             if action_type in {"click", "fill"}:
                 event: dict[str, Any] = {
@@ -294,8 +320,14 @@ class Explorer:
                 if action_id is None:
                     logger.warning("Skipping click result without an action_id: %s", step)
                     continue
-                self.memory.mark_action(page_url, action_id)
-                logger.info("Recorded click action %s on %s", action_id, page_url)
+                action = action_targets.get(action_id)
+                if action is None:
+                    logger.warning("Skipping click result for unknown action %s", action_id)
+                    continue
+                self.memory.mark_action(page_url, self._action_memory_key(action))
+                logger.info("Recorded click action %s on %s", action.text, page_url)
+        if state["execution_succeeded"]:
+            self.planner.record_execution(state["plan"], state["planner_candidates"])
         return {}
 
     @staticmethod

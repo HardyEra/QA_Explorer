@@ -6,6 +6,14 @@ class Action:
     id: int
     text: str
     type: str
+    # Lightweight, serializable extraction context. Existing consumers can
+    # continue using ``id``, ``text``, and ``type`` unchanged.
+    role: str | None = None
+    parent_role: str | None = None
+    container_context: str | None = None
+    ancestor_tags: list[str] = field(default_factory=list)
+    aria_role: str | None = None
+    tag_name: str | None = None
 
 
 @dataclass

@@ -1,115 +1,23 @@
 {
-  "flow_name": "Fill LinkedIn",
-  "description": "User journey: fill Username, fill Password, click Login, click Add to cart, click Sauce Labs Backpack, click Remove, click Go back Back to products, click Sauce Labs Bike Light, click Open Menu, click Go back Back to products, click Remove, click Sauce Labs Bolt T-Shirt, click Add to cart, click Go back Back to products, click Sauce Labs Fleece Jacket, click Add to cart, click Go back Back to products, click Sauce Labs Onesie, click Add to cart, click Go back Back to products, click Test.allTheThings() T-Shirt (Red), click Add to cart, click Go back Back to products, click Twitter, click Facebook, click LinkedIn.",
+  "flow_name": "Fill Log In",
+  "description": "User journey: fill Email, fill Password, click Log In.",
   "pages": [
-    "Swag Labs"
+    "Otomashen ATS"
   ],
   "steps": [
     {
       "type": "fill",
-      "target": "Username",
-      "value": "standard_user"
+      "target": "Email",
+      "value": "johnny@mail.com"
     },
     {
       "type": "fill",
       "target": "Password",
-      "value": "secret_sauce"
+      "value": "Qatest@12"
     },
     {
       "type": "click",
-      "target": "Login"
-    },
-    {
-      "type": "click",
-      "target": "Add to cart"
-    },
-    {
-      "type": "click",
-      "target": "Sauce Labs Backpack"
-    },
-    {
-      "type": "click",
-      "target": "Remove"
-    },
-    {
-      "type": "click",
-      "target": "Go back Back to products"
-    },
-    {
-      "type": "click",
-      "target": "Sauce Labs Bike Light"
-    },
-    {
-      "type": "click",
-      "target": "Open Menu"
-    },
-    {
-      "type": "click",
-      "target": "Go back Back to products"
-    },
-    {
-      "type": "click",
-      "target": "Remove"
-    },
-    {
-      "type": "click",
-      "target": "Sauce Labs Bolt T-Shirt"
-    },
-    {
-      "type": "click",
-      "target": "Add to cart"
-    },
-    {
-      "type": "click",
-      "target": "Go back Back to products"
-    },
-    {
-      "type": "click",
-      "target": "Sauce Labs Fleece Jacket"
-    },
-    {
-      "type": "click",
-      "target": "Add to cart"
-    },
-    {
-      "type": "click",
-      "target": "Go back Back to products"
-    },
-    {
-      "type": "click",
-      "target": "Sauce Labs Onesie"
-    },
-    {
-      "type": "click",
-      "target": "Add to cart"
-    },
-    {
-      "type": "click",
-      "target": "Go back Back to products"
-    },
-    {
-      "type": "click",
-      "target": "Test.allTheThings() T-Shirt (Red)"
-    },
-    {
-      "type": "click",
-      "target": "Add to cart"
-    },
-    {
-      "type": "click",
-      "target": "Go back Back to products"
-    },
-    {
-      "type": "click",
-      "target": "Twitter"
-    },
-    {
-      "type": "click",
-      "target": "Facebook"
-    },
-    {
-      "type": "click",
-      "target": "LinkedIn"
+      "target": "Log In"
     }
   ]
 }

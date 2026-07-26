@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,6 +21,7 @@ if str(BACKEND_APP) not in sys.path:
     sys.path.insert(0, str(BACKEND_APP))
 
 from runner import run_exploration  # noqa: E402
+from asset_manager import AssetManager  # noqa: E402
 
 
 st.set_page_config(page_title="QA Explorer", page_icon="🔎", layout="wide")
@@ -45,6 +47,34 @@ def start_run(inputs: dict[str, object]) -> tuple[threading.Thread, queue.Queue]
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     return thread, events
+
+
+asset_manager = AssetManager()
+with st.expander("Test Assets", expanded=True):
+    st.caption("Upload one resume for applications that include a file-upload field.")
+    uploaded_resume = st.file_uploader(
+        "Resume",
+        type=["pdf", "doc", "docx"],
+        key="resume_upload",
+    )
+    if uploaded_resume is not None:
+        uploaded_content = uploaded_resume.getvalue()
+        upload_signature = (uploaded_resume.name, sha256(uploaded_content).hexdigest())
+        if st.session_state.get("stored_resume_signature") != upload_signature:
+            try:
+                stored_path = asset_manager.save_resume(
+                    uploaded_resume.name,
+                    uploaded_content,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["stored_resume_signature"] = upload_signature
+                st.success(f"Resume saved: {stored_path.name}")
+    else:
+        stored_resume = asset_manager.resolve_resume_path()
+        if stored_resume:
+            st.caption(f"Stored resume: {stored_resume.name}")
 
 
 with st.form("exploration_form"):
