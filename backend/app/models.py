@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,7 +17,28 @@ from typing import Any
 
 @dataclass
 class Observation:
+    """Page observation with legacy and accessibility-first representations.
+
+    ``page`` and ``actions`` remain available for the existing explorer and
+    planner.  ``page_title`` and ``available_actions`` provide the explicit
+    observation contract used by the accessibility pipeline.
+    """
+
     page: Page
     actions: list[Action]
     inputs: list[Any]
     forms: list[Any]
+    accessibility_tree: list[dict[str, Any]] = field(default_factory=list)
+    page_summary: str = ""
+    page_title: str = ""
+    available_actions: list[Action] | None = None
+
+    def __post_init__(self) -> None:
+        # Keep current consumers of ``page.title`` and ``actions`` working,
+        # while accepting the explicit accessibility-observation field names.
+        if not self.page_title:
+            self.page_title = self.page.title
+        if self.available_actions is None:
+            self.available_actions = self.actions
+        else:
+            self.actions = self.available_actions

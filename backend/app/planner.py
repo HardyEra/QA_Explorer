@@ -1,5 +1,5 @@
-from google import genai
-from config import GOOGLE_API_KEY
+from groq import Groq
+from config import GROQ_API_KEY
 import json
 import logging
 import os
@@ -7,23 +7,40 @@ import os
 
 logger = logging.getLogger(__name__)
 MODEL_TIMEOUT_MS = int(os.getenv("MODEL_TIMEOUT_MS", "10000"))
+PLANNER_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+PLANNER_TEMPERATURE = 0
+
+
+def _usage_details(response):
+    """Normalize Groq usage metadata to Langfuse's provider-neutral fields."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return None
+    input_tokens = getattr(usage, "prompt_tokens", None)
+    output_tokens = getattr(usage, "completion_tokens", None)
+    details = {}
+    if input_tokens is not None:
+        details["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        details["output_tokens"] = output_tokens
+    return details or None
 
 class Planner:
 
-    def __init__(self):
-        # self.client = Groq(api_key=GROQ_API_KEY)
-        if not GOOGLE_API_KEY:
-            logger.warning("GOOGLE_API_KEY is not configured; using local fallback planning")
+    def __init__(self, observability):
+        self.observability = observability
+        if not GROQ_API_KEY:
+            logger.warning("GROQ_API_KEY is not configured; using local fallback planning")
             self.client = None
             self.remote_planning_available = False
         else:
-            self.client = genai.Client(
-                api_key=GOOGLE_API_KEY,
-                http_options=genai.types.HttpOptions(timeout=MODEL_TIMEOUT_MS),
+            self.client = Groq(
+                api_key=GROQ_API_KEY,
+                timeout=MODEL_TIMEOUT_MS / 1000,
             )
             self.remote_planning_available = True
 
-    def _fallback_plan(self, observation):
+    def _fallback_plan(self, observation, provided_username="", provided_password=""):
         """Make conservative progress when the model service is unavailable.
 
         The fallback is intentionally deterministic: it completes a familiar
@@ -69,12 +86,12 @@ class Planner:
                         {
                             "type": "fill",
                             "target": target(username),
-                            "value": os.getenv("QA_USERNAME", "standard_user"),
+                            "value": provided_username or os.getenv("QA_USERNAME", "standard_user"),
                         },
                         {
                             "type": "fill",
                             "target": target(password),
-                            "value": os.getenv("QA_PASSWORD", "secret_sauce"),
+                            "value": provided_password or os.getenv("QA_PASSWORD", "secret_sauce"),
                         },
                         {"type": "click", "action_id": login_action.id},
                     ]
@@ -91,15 +108,23 @@ class Planner:
 
         return {"steps": []}
 
-    def plan(self, observation, visited_pages, visited_actions):
+    def plan(self, observation, visited_pages, visited_actions, config=None):
 
         visited_pages_text = "\n".join(visited_pages) or "None"
 
         visited_actions_text = "\n".join(visited_actions) or "None"
 
-        actions = "\n".join(
-            f"{a.id} - {a.text} ({a.type})"
-            for a in observation.actions
+        actions = json.dumps(
+            [
+                {
+                    "id": action.id,
+                    "text": action.text,
+                    "category": action.category,
+                    "priority": action.priority,
+                }
+                for action in observation.actions
+            ],
+            indent=2,
         )
 
         inputs = "\n".join(
@@ -130,28 +155,30 @@ Already Visited Pages:
 Already Executed Actions:
 {visited_actions_text}
 
-Authentication Rules:
+Application context supplied by the user:
+{getattr(config, "application_context", "") or "None"}
 
-- If the current URL contains "inventory", "cart", "checkout", "inventory-item", or any page other than the login page, you are already logged in.
-- Never attempt to log in again unless the current URL is the login page.
-Rules:
-- Login ONLY if the current page is the login page.
-- Otherwise never generate login steps.
-- Prefer unexplored pages.
-- If an action cannot be clicked because another UI element blocks it (menu, modal, dropdown), first open that UI element.
-- Return exactly ONE JSON object.
-- Do not explain your reasoning.
-- Do not use markdown.
-- Do not output anything except JSON.
+Exploration objective:
+{getattr(config, "current_goal", "Autonomously discover application pages and actions")}
 
-Never repeat an action already executed on the same page.
-Prefer actions that lead to unexplored pages.
+Credentials supplied by the user (use only when a matching login form is present):
+Username: {getattr(config, "username", "") or "Not supplied"}
+Password: {getattr(config, "password", "") or "Not supplied"}
 
-Your goal is to explore the application autonomously.
+Your objective is to discover meaningful business workflows.
 
-Avoid redundant interactions.
-If multiple actions have the same purpose, explore only one representative example unless there is evidence they behave differently.
-Prioritize discovering new pages and unique functionality over repeating identical operations.
+Each available action contains a deterministic category and priority. Higher priority
+means the action is more likely to advance primary application functionality. The
+actions are already ranked in descending priority.
+
+Always prioritize actions that advance the application's primary functionality.
+Avoid low-value actions such as social media, footer links, and legal pages unless
+there are no meaningful alternatives. Prefer unexplored pages and unique workflows.
+Do not repeat an action already executed on the same page.
+
+If an action cannot be clicked because another UI element blocks it (menu, modal,
+dropdown), first open that UI element. Return exactly ONE JSON object, with no
+reasoning, markdown, or text outside the JSON.
 
 JSON Format:
 
@@ -176,39 +203,45 @@ JSON Format:
 """
 
         if not self.remote_planning_available:
-            return self._fallback_plan(observation)
+            return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
 
-        logger.info("Requesting plan from Gemini (timeout=%sms)", MODEL_TIMEOUT_MS)
-        try:
-            response = self.client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=prompt,
-                config=genai.types.GenerateContentConfig(
-                    temperature=0,
-                    response_mime_type="application/json",
-                ),
-            )
-        except Exception:
-            # A 5xx/timeout is transient and should not terminate browser QA.
-            # Avoid making every subsequent graph step wait for another timeout.
-            logger.exception("Gemini plan request failed; switching to local fallback planning")
-            self.remote_planning_available = False
-            return self._fallback_plan(observation)
+        logger.info("Requesting plan from Groq model %s (timeout=%sms)", PLANNER_MODEL, MODEL_TIMEOUT_MS)
+        with self.observability.generation(
+            "Planner.generate_plan", model=PLANNER_MODEL,
+            temperature=PLANNER_TEMPERATURE, input=prompt,
+            metadata={"provider": "groq", "retry_count": 0},
+        ) as generation:
+            try:
+                response = self.client.chat.completions.create(
+                    model=PLANNER_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=PLANNER_TEMPERATURE,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as exc:
+                self.observability.record_exception(exc, input=prompt, retry_count=0)
+                logger.exception("Groq plan request failed; switching to local fallback planning")
+                self.remote_planning_available = False
+                return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
 
-        content = response.text.strip()
+            content = (response.choices[0].message.content or "").strip()
+            generation.update(output=content, usage_details=_usage_details(response))
 
-        try:
-            plan = json.loads(content)
-        except json.JSONDecodeError:
-            logger.warning("Gemini returned invalid JSON; using local fallback plan")
-            return self._fallback_plan(observation)
+            try:
+                plan = json.loads(content)
+            except json.JSONDecodeError as exc:
+                self.observability.record_exception(exc, input=prompt, output=content, retry_count=0)
+                logger.warning("Groq returned invalid JSON; using local fallback plan")
+                return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
 
-        if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
-            logger.warning("Gemini returned an invalid plan shape; using local fallback plan")
-            return self._fallback_plan(observation)
+            if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
+                exc = ValueError("Groq returned an invalid plan shape")
+                self.observability.record_exception(exc, input=prompt, output=content, retry_count=0)
+                logger.warning("Groq returned an invalid plan shape; using local fallback plan")
+                return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
 
         print(content)
-        logger.info("Received and parsed Gemini plan")
+        logger.info("Received and parsed Groq plan")
 
 
         return plan

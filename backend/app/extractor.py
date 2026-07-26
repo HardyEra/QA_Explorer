@@ -1,5 +1,7 @@
 from models import Action, Observation, Page
 from action_deduplicator import ActionDeduplicator
+from accessibility_extractor import AccessibilityExtractor
+from page_summary import PageSummaryGenerator
 
 class PageExtractor:
 
@@ -7,6 +9,8 @@ class PageExtractor:
         self.page = page
         self.action_registry = action_registry
         self.deduplicator = ActionDeduplicator()
+        self.accessibility_extractor = AccessibilityExtractor(page, action_registry)
+        self.page_summary_generator = PageSummaryGenerator()
     # --------------------------
     # Safe helpers
     # --------------------------
@@ -246,6 +250,22 @@ class PageExtractor:
 
         self.action_registry.clear()
 
+        # The accessibility tree is the primary source of page semantics and
+        # interactive controls. Keep the DOM path only for browsers/pages where
+        # Playwright cannot provide an accessibility snapshot.
+        accessibility = self.accessibility_extractor.extract()
+        if accessibility is not None:
+            page = Page(title=self.page.title(), url=self.page.url)
+            return Observation(
+                page=page,
+                actions=self.deduplicator.deduplicate(accessibility.actions),
+                inputs=accessibility.inputs,
+                forms=accessibility.forms,
+                accessibility_tree=accessibility.tree,
+                page_summary=self.page_summary_generator.generate(page.title, accessibility.tree),
+                page_title=page.title,
+            )
+
         return Observation(
             page=Page(
                 title=self.page.title(),
@@ -255,5 +275,8 @@ class PageExtractor:
                 self.get_actions()
             ),
             inputs=self.get_inputs(),
-            forms=self.get_forms()
+            forms=self.get_forms(),
+            accessibility_tree=[],
+            page_summary="",
+            page_title=self.page.title(),
         )

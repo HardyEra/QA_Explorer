@@ -1,13 +1,18 @@
 """LangGraph workflow for autonomous browser exploration."""
 
 import logging
-from typing import Any, Literal, TypedDict
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import Any, Callable, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from executor import Executor
 from exploration_memory import ExplorationMemory
 from planner import Planner
+from action_classifier import ActionClassifier, ActionRanker, ClassifiedAction
+from observability.decorators import traced_node
+from observability.tracing import TraceMetadata
 
 
 logger = logging.getLogger(__name__)
@@ -19,8 +24,12 @@ class ExplorationState(TypedDict, total=False):
     observation: Any
     plan: dict[str, Any]
     available_actions: list[Any]
+    classified_actions: list[ClassifiedAction]
+    ranked_actions: list[ClassifiedAction]
+    planner_candidates: list[ClassifiedAction]
     source_url: str
     execution_succeeded: bool
+    exploration_history: list[dict[str, Any]]
     in_scope: bool
     iterations: int
 
@@ -28,21 +37,42 @@ class ExplorationState(TypedDict, total=False):
 class Explorer:
     """Explore an application through an explicit LangGraph state machine."""
 
-    def __init__(self, browser, config):
+    def __init__(self, browser, config, observability, on_event: Callable[[dict[str, Any]], None] | None = None):
         self.browser = browser
         self.config = config
-        self.planner = Planner()
-        self.executor = Executor(browser)
+        self.observability = observability
+        self.planner = Planner(observability)
+        self.executor = Executor(browser, observability)
         self.memory = ExplorationMemory()
+        # This is the single canonical, serializable record of Discovery's
+        # observed pages and attempted business actions.  It is returned to
+        # orchestration after the graph reaches END.
+        self.execution_history: list[dict[str, Any]] = []
+        self.action_classifier = ActionClassifier()
+        self.action_ranker = ActionRanker()
+        self.on_event = on_event or (lambda event: None)
         self.browser.set_new_tab_policy(config.explore_new_tabs)
         self.browser.set_navigation_policy(config.start_url, config.follow_external)
         self.graph = self._build_graph()
+
+    def trace_metadata(self, state: ExplorationState | None = None) -> dict[str, Any]:
+        """Snapshot the required discovery metadata for a child observation."""
+        current_page = self.browser.current_url() if self.browser.page else None
+        return TraceMetadata(
+            project_name=self.config.project_name,
+            session_id=self.config.session_id,
+            exploration_id=self.config.exploration_id,
+            current_page=current_page,
+            visited_pages=sorted(self.memory.visited_pages),
+            visited_actions=sorted(self.memory.executed_actions),
+            current_goal=self.config.current_goal,
+        ).model_dump(mode="json")
 
     def _build_graph(self):
         workflow = StateGraph(ExplorationState)
         workflow.add_node("observe", self._observe)
         workflow.add_node("check_scope", self._check_scope)
-        workflow.add_node("select_actions", self._select_actions)
+        workflow.add_node("prepare_candidates", self._prepare_candidates)
         workflow.add_node("plan", self._plan)
         workflow.add_node("execute", self._execute)
         workflow.add_node("record_result", self._record_result)
@@ -52,10 +82,14 @@ class Explorer:
         workflow.add_conditional_edges(
             "check_scope",
             self._scope_route,
-            {"select_actions": "select_actions", "observe": "observe"},
+            {
+                "prepare_candidates": "prepare_candidates",
+                "observe": "observe",
+                "complete": END,
+            },
         )
         workflow.add_conditional_edges(
-            "select_actions",
+            "prepare_candidates",
             self._action_route,
             {"plan": "plan", "complete": END},
         )
@@ -65,8 +99,20 @@ class Explorer:
 
         return workflow.compile()
 
+    @traced_node("Discovery Agent.observe")
     def _observe(self, state: ExplorationState) -> ExplorationState:
         observation = self.browser.observe()
+        self.execution_history.append(
+            {
+                "action_type": "navigation",
+                "success": True,
+                "page_title": observation.page.title,
+                "url": observation.page.url,
+                "timestamp": self._timestamp(),
+            }
+        )
+        self.on_event({"type": "observation", "url": observation.page.url,
+                       "status": "Observing page", "iteration": state.get("iterations", 0) + 1})
         logger.info(
             "Observation %s: title=%r url=%s actions=%s",
             state.get("iterations", 0) + 1,
@@ -85,22 +131,29 @@ class Explorer:
             "iterations": state.get("iterations", 0) + 1,
         }
 
+    @traced_node("Discovery Agent.check_scope")
     def _check_scope(self, state: ExplorationState) -> dict[str, Any]:
         observation = state["observation"]
         if not self.config.in_scope(observation.page.url):
             logger.warning("Out-of-scope URL encountered: %s", observation.page.url)
             print("\nOutside exploration scope.")
             print(observation.page.url)
-            self.browser.page.go_back()
+            self.browser.go_back()
             return {"in_scope": False}
 
         return {"in_scope": True}
 
     def _scope_route(
         self, state: ExplorationState
-    ) -> Literal["select_actions", "observe"]:
-        return "select_actions" if state["in_scope"] else "observe"
+    ) -> Literal["prepare_candidates", "observe", "complete"]:
+        if state["in_scope"]:
+            return "prepare_candidates"
+        if state["iterations"] >= self.config.max_steps:
+            logger.info("Stopping after configured maximum of %s observations", self.config.max_steps)
+            return "complete"
+        return "observe"
 
+    @traced_node("Discovery Agent.select_actions")
     def _select_actions(self, state: ExplorationState) -> ExplorationState:
         observation = state["observation"]
         self.memory.mark_page(observation.page.url)
@@ -127,43 +180,147 @@ class Explorer:
             logger.info("Stopping after configured maximum of %s observations", self.config.max_steps)
             print(f"\n[OK] Exploration stopped after {self.config.max_steps} observations.")
             return "complete"
-        if not state["available_actions"]:
+        if not state["planner_candidates"]:
             logger.info("Exploration complete; no unexplored actions remain")
             print("\n[OK] Exploration complete.")
             return "complete"
         return "plan"
 
+    def _prepare_candidates(self, state: ExplorationState) -> dict[str, Any]:
+        """Prepare planner candidates in one graph superstep.
+
+        Selection, classification, and ranking retain their existing order and
+        behavior.  Grouping their state hand-offs prevents LangGraph's
+        superstep safeguard from firing before the configured observation limit
+        can reach its normal ``END`` route.
+        """
+        selected = self._select_actions(state)
+        classified = self._classify_actions({**state, **selected})
+        ranked = self._rank_actions({**state, **selected, **classified})
+        candidates = self._select_candidates(
+            {**state, **selected, **classified, **ranked}
+        )
+        return {**selected, **classified, **ranked, **candidates}
+
+    @traced_node("Action Classification")
+    def _classify_actions(self, state: ExplorationState) -> dict[str, Any]:
+        classified_actions = self.action_classifier.classify_all(state["available_actions"])
+        logger.info("Action Classification")
+        for action in classified_actions:
+            logger.info(
+                "%s | category=%s | priority=%s",
+                action.text,
+                action.category,
+                action.priority,
+            )
+        return {"classified_actions": classified_actions}
+
+    @traced_node("Action Ranking")
+    def _rank_actions(self, state: ExplorationState) -> dict[str, Any]:
+        ranked_actions = self.action_ranker.rank(state["classified_actions"])
+        logger.info("Action Ranking completed for %s actions", len(ranked_actions))
+        return {"ranked_actions": ranked_actions}
+
+    @traced_node("Planner Candidate Selection")
+    def _select_candidates(self, state: ExplorationState) -> dict[str, Any]:
+        candidates = state["ranked_actions"][:self.config.max_planner_actions]
+        logger.info("Planner Candidates")
+        for position, action in enumerate(candidates, start=1):
+            logger.info("%s. %s (%s)", position, action.text, action.priority)
+        return {"planner_candidates": candidates}
+
+    @traced_node("Planner")
     def _plan(self, state: ExplorationState) -> dict[str, Any]:
-        observation = state["observation"]
-        # The planner sees only actions that have not yet been executed on this page.
-        observation.actions = state["available_actions"]
+        # The planner receives only the highest-ranked, unexplored actions.
+        # ``Observation.__post_init__`` keeps ``actions`` aligned with its
+        # backwards-compatible ``available_actions`` alias.  Update both when
+        # copying the observation so classified metadata is not replaced by the
+        # original plain Action objects during ``dataclasses.replace``.
+        observation = replace(
+            state["observation"],
+            actions=state["planner_candidates"],
+            available_actions=state["planner_candidates"],
+        )
         plan = self.planner.plan(
             observation,
             self.memory.visited_pages,
             self.memory.executed_actions,
+            self.config,
         )
         logger.info("Planner returned %s steps", len(plan.get("steps", [])))
+        self.on_event({"type": "status", "status": "Executing plan", "url": observation.page.url})
         print(plan)
         return {"plan": plan, "source_url": observation.page.url}
 
+    @traced_node("Executor")
     def _execute(self, state: ExplorationState) -> dict[str, Any]:
         success = self.executor.execute(state["plan"])
+        self.on_event({"type": "status", "status": "Plan execution succeeded" if success else "Plan execution failed",
+                       "url": self.browser.current_url()})
         logger.info("Plan execution %s", "succeeded" if success else "failed")
         if not success:
             print("Execution failed.")
         return {"execution_succeeded": success}
 
+    @traced_node("Discovery Agent.record_result")
     def _record_result(self, state: ExplorationState) -> dict[str, Any]:
         """Record attempted clicks so an unclickable action is not retried forever."""
         page_url = state["source_url"]
+        page = state["observation"].page
+        action_targets = {
+            action.id: action.text for action in state["planner_candidates"]
+        }
         for step in state["plan"].get("steps", []):
+            action_type = step.get("type")
+            target = step.get("target")
+            if action_type == "click":
+                target = action_targets.get(step.get("action_id"), target)
+
+            if action_type in {"click", "fill"}:
+                event: dict[str, Any] = {
+                    "action_type": action_type,
+                    "target": target,
+                    "success": state["execution_succeeded"],
+                    "page_title": page.title,
+                    "url": page_url,
+                    "timestamp": self._timestamp(),
+                }
+                if action_type == "fill":
+                    event["value"] = step.get("value")
+                self.execution_history.append(event)
+
             if step.get("type") == "click":
-                self.memory.mark_action(page_url, step["action_id"])
-                logger.info("Recorded click action %s on %s", step["action_id"], page_url)
+                action_id = step.get("action_id")
+                if action_id is None:
+                    logger.warning("Skipping click result without an action_id: %s", step)
+                    continue
+                self.memory.mark_action(page_url, action_id)
+                logger.info("Recorded click action %s on %s", action_id, page_url)
         return {}
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
     def explore(self) -> ExplorationState:
         """Run the graph until no actions remain or ``config.max_steps`` is reached."""
         # LangGraph counts every node traversal, not browser observations.
         recursion_limit = max(self.config.max_steps * 6 + 10, 100)
-        return self.graph.invoke({}, config={"recursion_limit": recursion_limit})
+        metadata = TraceMetadata(**self.trace_metadata())
+        try:
+            with self.observability.trace(
+                "Discovery Agent", metadata=metadata,
+                input={"start_url": self.config.start_url, "max_steps": self.config.max_steps},
+            ) as trace:
+                result = self.graph.invoke({}, config={"recursion_limit": recursion_limit})
+                trace.update(
+                    output={"iterations": result.get("iterations", 0)},
+                    metadata=self.trace_metadata(result),
+                )
+                result["exploration_history"] = self.execution_history
+                return result
+        except Exception as exc:
+            self.observability.record_exception(exc, input={"start_url": self.config.start_url})
+            raise
+        finally:
+            self.observability.flush()

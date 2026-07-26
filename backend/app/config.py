@@ -1,10 +1,10 @@
 from dotenv import load_dotenv
 import os
+from uuid import uuid4
 from urllib.parse import urlparse
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 class ExplorationConfig:
 
@@ -12,12 +12,28 @@ class ExplorationConfig:
                  start_url,
                  follow_external=False,
                  explore_new_tabs=False,
-                 max_steps=100):
+                 max_steps=100,
+                 max_planner_actions=10,
+                 project_name="qa-explorer",
+                 session_id=None,
+                 exploration_id=None,
+                 current_goal="Autonomously discover application pages and actions",
+                 application_context="",
+                 username="",
+                 password=""):
 
         self.start_url = start_url
         self.follow_external = follow_external
         self.explore_new_tabs = explore_new_tabs
         self.max_steps = max_steps
+        self.max_planner_actions = max_planner_actions
+        self.project_name = project_name
+        self.session_id = session_id or str(uuid4())
+        self.exploration_id = exploration_id or str(uuid4())
+        self.current_goal = current_goal
+        self.application_context = application_context
+        self.username = username
+        self.password = password
 
         self.base_domain = urlparse(start_url).netloc
 

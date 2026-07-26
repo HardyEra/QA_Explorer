@@ -4,6 +4,10 @@ from action_registry import ActionRegistry
 from playwright.sync_api import Error, TimeoutError
 import logging
 from urllib.parse import urlparse
+from contextlib import contextmanager
+from time import perf_counter
+
+from observability.tracing import NoopObservability
 
 
 logger = logging.getLogger(__name__)
@@ -19,8 +23,10 @@ class BrowserController:
         self.explore_new_tabs = False
         self.follow_external = False
         self.base_domain = None
+        self.observability = NoopObservability()
 
-    def start(self):
+    def start(self, observability=None):
+        self.observability = observability or NoopObservability()
         self.playwright = sync_playwright().start()
 
         self.browser = self.playwright.chromium.launch(
@@ -39,8 +45,42 @@ class BrowserController:
             self.action_registry
         )
 
+    @contextmanager
+    def _browser_action(self, action, selector=None):
+        """Record browser operations through the provider-neutral interface."""
+        started_at = perf_counter()
+        initial_url = self.page.url if self.page else None
+        success = False
+        with self.observability.span(
+            "Playwright." + action,
+            input={"action": action, "selector": selector, "page_url": initial_url},
+            metadata={"observation_type": "browser_action"},
+        ) as span:
+            try:
+                yield
+                success = True
+            except Exception as exc:
+                self.observability.record_exception(
+                    exc,
+                    input={"action": action, "selector": selector, "page_url": initial_url},
+                )
+                raise
+            finally:
+                span.update(output={
+                    "action": action,
+                    "selector": selector,
+                    "page_url": self.page.url if self.page else initial_url,
+                    "success": success,
+                    "execution_time_ms": round((perf_counter() - started_at) * 1000, 2),
+                })
+
     def open(self, url):
-        self.page.goto(url)
+        with self._browser_action("navigate", selector=url):
+            self.page.goto(url)
+
+    def go_back(self):
+        with self._browser_action("navigate", selector="browser.go_back"):
+            return self.page.go_back()
 
     def set_new_tab_policy(self, explore_new_tabs=False):
         """Choose whether click-triggered popup tabs should remain open."""
@@ -75,10 +115,12 @@ class BrowserController:
             return
         logger.info("Returning from external URL %s to %s", self.page.url, previous_url)
         try:
-            self.page.go_back(wait_until="domcontentloaded", timeout=5000)
+            with self._browser_action("navigate", selector="browser.go_back"):
+                self.page.go_back(wait_until="domcontentloaded", timeout=5000)
         except TimeoutError:
             logger.warning("Timed out returning from external URL; opening previous URL directly")
-            self.page.goto(previous_url, wait_until="domcontentloaded")
+            with self._browser_action("navigate", selector=previous_url):
+                self.page.goto(previous_url, wait_until="domcontentloaded")
 
     def title(self):
         return self.page.title()
@@ -86,15 +128,27 @@ class BrowserController:
     def current_url(self):
         return self.page.url
 
-    def screenshot(self, name="page.png"):
-        self.page.screenshot(path=f"screenshots/{name}")
+    def screenshot(self, path):
+        """Save a screenshot at a caller-provided absolute or relative path."""
+        self.page.screenshot(path=path)
 
     def close(self):
-        self.browser.close()
-        self.playwright.stop()
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
 
     def click(self, selector):
-        self.page.locator(selector).click()
+        with self._browser_action("click", selector):
+            self.page.locator(selector).click()
+
+    def select_option(self, selector, value):
+        with self._browser_action("select", selector):
+            self.page.locator(selector).select_option(value)
+
+    def wait_for_timeout(self, timeout_ms):
+        with self._browser_action("wait", selector=f"timeout:{timeout_ms}ms"):
+            self.page.wait_for_timeout(timeout_ms)
 
     def get_buttons(self):
         return self.extractor.get_buttons()
@@ -124,17 +178,20 @@ class BrowserController:
 
         try:
             before_url = self.page.url
-            action["locator"].click(timeout=5000)
+            with self._browser_action("click", str(action_id)):
+                action["locator"].click(timeout=5000)
             # The context-level page event normally closes popups synchronously.
             # Keep this short check for delayed popup creation.
-            self.page.wait_for_timeout(250)
+            self.wait_for_timeout(250)
             self._close_child_tabs()
             self._return_to_main_domain(before_url)
             # A click can trigger a client-side route without a formal navigation.
             # Waiting for a quiet network gives the next graph observation stable DOM data.
             try:
-                self.page.wait_for_load_state("domcontentloaded", timeout=5000)
-                self.page.wait_for_load_state("networkidle", timeout=2000)
+                with self._browser_action("wait", selector="domcontentloaded"):
+                    self.page.wait_for_load_state("domcontentloaded", timeout=5000)
+                with self._browser_action("wait", selector="networkidle"):
+                    self.page.wait_for_load_state("networkidle", timeout=2000)
             except TimeoutError:
                 logger.info("Page did not become network-idle after action %s; continuing", action_id)
             logger.info(
@@ -148,6 +205,9 @@ class BrowserController:
 
         except (Error, TimeoutError) as exc:
             logger.exception("Failed to click action %s: %s", action_id, exc)
+            self.observability.record_exception(
+                exc, input={"action": "click", "selector": str(action_id), "page_url": self.page.url}
+            )
             print(f"Failed to click action {action_id}")
             return False
 
@@ -163,11 +223,15 @@ class BrowserController:
 
         for strategy in strategies:
             try:
-                locator = strategy()
-                locator.first.wait_for(state="visible", timeout=500)
-                locator.first.fill(value)
+                with self._browser_action("fill", target):
+                    locator = strategy()
+                    locator.first.wait_for(state="visible", timeout=500)
+                    locator.first.fill(value)
                 return True
-            except Exception:
+            except Exception as exc:
+                self.observability.record_exception(
+                    exc, input={"action": "fill", "selector": target, "page_url": self.page.url}
+                )
                 pass
 
         print(f"Couldn't find input: {target}")
