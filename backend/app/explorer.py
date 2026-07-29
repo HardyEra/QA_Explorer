@@ -13,6 +13,7 @@ from planner import Planner
 from action_classifier import ActionClassifier, ActionRanker, ClassifiedAction
 from observability.decorators import traced_node
 from observability.tracing import TraceMetadata
+from vision_observer import VisionObserver
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class Explorer:
         # below an Explorer node's tracing context.
         self.browser.workflow_name = config.current_goal
         self.planner = Planner(observability)
+        self.vision_observer = VisionObserver(observability=observability)
         self.executor = Executor(browser, observability)
         self.memory = ExplorationMemory()
         # This is the single canonical, serializable record of Discovery's
@@ -109,6 +111,21 @@ class Explorer:
     @traced_node("Discovery Agent.observe")
     def _observe(self, state: ExplorationState) -> ExplorationState:
         observation = self.browser.observe()
+        # Vision is supplementary perception: a Gemini outage, missing key,
+        # or invalid model response must never prevent DOM-first exploration.
+        if self.vision_observer.api_key:
+            try:
+                observation.vision_observation = self.vision_observer.observe(self.browser.page)
+                logger.info(
+                    "Vision observation attached: page_type=%s dialogs=%s buttons=%s",
+                    observation.vision_observation.page_type,
+                    len(observation.vision_observation.dialogs),
+                    len(observation.vision_observation.buttons),
+                )
+            except Exception as exc:
+                logger.warning("Vision observation unavailable; continuing without it: %s", exc)
+        else:
+            logger.info("Vision observation skipped: GEMINI_API_KEY is not configured")
         self.execution_history.append(
             {
                 "action_type": "navigation",

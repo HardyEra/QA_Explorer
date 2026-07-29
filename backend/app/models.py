@@ -39,6 +39,9 @@ class Observation:
     accessibility_tree: list[dict[str, Any]] = field(default_factory=list)
     page_summary: str = ""
     page_title: str = ""
+    # Optional, screenshot-derived UI context. Kept independent from the DOM
+    # and accessibility representations so planner consumers can use either.
+    vision_observation: Any | None = None
     available_actions: list[Action] | None = None
 
     def __post_init__(self) -> None:

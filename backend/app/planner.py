@@ -550,6 +550,7 @@ class Planner:
             "active_action": "Plan",
         }
         decision_actions = self._decision_candidates(observation.actions)
+        vision_context = self._vision_context(observation)
         actions = json.dumps(
             [
                 {
@@ -581,6 +582,9 @@ URL:
 
 Available Inputs:
 {inputs}
+
+Visual UI Observation (Gemini screenshot analysis; current viewport only):
+{vision_context}
 
 Available Actions:
 {actions}
@@ -703,3 +707,26 @@ JSON Format:
         print(content)
         logger.info("Received and parsed Groq plan")
         return plan
+
+    @staticmethod
+    def _vision_context(observation) -> str:
+        """Serialize optional Gemini perception for Groq without exposing an image.
+
+        Gemini receives the screenshot. Groq receives only its validated,
+        structured description, which keeps the planner prompt compact and
+        makes the hand-off visible in application logs and Langfuse.
+        """
+        vision = getattr(observation, "vision_observation", None)
+        if vision is None:
+            logger.info("Planner visual context: unavailable")
+            return "Unavailable for this observation. Use the DOM/accessibility actions."
+        payload = {
+            key: getattr(vision, key, None)
+            for key in (
+                "page_type", "summary", "dialogs", "buttons", "links",
+                "navigation", "forms", "inputs", "tables", "warnings",
+            )
+        }
+        serialized = json.dumps(payload, ensure_ascii=False)
+        logger.info("Planner visual context: %s", serialized)
+        return serialized

@@ -89,8 +89,23 @@ with st.form("exploration_form"):
     )
     exploration_goal = st.text_area(
         "Exploration Goal (optional)",
-        placeholder="Purchase a product\nBook an appointment\nComplete employee onboarding\nSubmit a leave request",
+        placeholder=(
+            "Go to Candidates from the sidebar, search for Nicole, edit the candidate, "
+            "change the name to Max, save, then logout"
+        ),
         height=100,
+    )
+    st.caption("Choose a recognized command when describing the page or module to open.")
+    st.info(
+        "Recognized commands: **Go to**, **Select**, **Choose**, **Open**, **Navigate to**."
+    )
+    st.success(
+        "Good example: `Go to Candidates from the sidebar, search for Nicole, open Edit "
+        "Candidate, change the name to Max, save, then logout.`"
+    )
+    st.warning(
+        "Avoid: `Click on Candidates from the left sidebar...` — the current goal parser may "
+        "not identify `Candidates` as the required destination."
     )
     max_steps = st.number_input("Maximum Exploration Steps", min_value=1, max_value=500, value=30, step=1)
     submitted = st.form_submit_button("Start Exploration", type="primary", use_container_width=True)

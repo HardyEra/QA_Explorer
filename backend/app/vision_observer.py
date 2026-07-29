@@ -102,11 +102,11 @@ class VisionObserver:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gemini-2.5-flash",
+        model: str | None = None,
         observability: ObservabilityBackend | None = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY", "")
-        self.model = model
+        self.model = model or os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
         self.observability = observability or NoopObservability()
 
     def observe(self, page: PlaywrightPage) -> VisionObservation:
