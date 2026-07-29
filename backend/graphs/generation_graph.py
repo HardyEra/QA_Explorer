@@ -11,6 +11,7 @@ from langgraph.graph import END, START, StateGraph
 
 from agents.flow_generator import FlowGenerator
 from .state import QAState
+from observability.tracing import NoopObservability, ObservabilityBackend
 
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,13 @@ class GenerationGraph:
     only the normalized business flow today.
     """
 
-    def __init__(self, flow_generator: FlowGenerator | None = None) -> None:
+    def __init__(
+        self,
+        flow_generator: FlowGenerator | None = None,
+        observability: ObservabilityBackend | None = None,
+    ) -> None:
         self.flow_generator = flow_generator or FlowGenerator()
+        self.observability = observability or NoopObservability()
         self.graph = self._build()
 
     def _build(self):
@@ -38,26 +44,38 @@ class GenerationGraph:
         return workflow.compile()
 
     def _generate_flow(self, state: QAState) -> dict[str, Any]:
-        logger.info("Generation Graph started")
-        logger.info("Flow generation started")
-        flow = self.flow_generator.generate_json(state.get("exploration_history", []))
-        logger.info("Flow generated successfully")
-        FLOW_EXPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FLOW_EXPORT_PATH.write_text(
-            json.dumps(flow, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        logger.info("Flow saved to: %s", FLOW_EXPORT_LOG_PATH)
-        logger.info("Generation Graph completed")
-        # Returning only the updated key lets LangGraph preserve every other
-        # field in the shared state.
-        return {"flow": flow}
+        with self.observability.span(
+            "Flow Generation",
+            input={"history_event_count": len(state.get("exploration_history", []))},
+            metadata={"workflow_name": state.get("task", "")},
+        ) as span:
+            try:
+                logger.info("Generation Graph started")
+                flow = self.flow_generator.generate_json(state.get("exploration_history", []))
+                FLOW_EXPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+                FLOW_EXPORT_PATH.write_text(
+                    json.dumps(flow, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                span.update(output={"flow_name": flow.get("flow_name"), "path": FLOW_EXPORT_LOG_PATH})
+                logger.info("Flow generated successfully")
+                return {"flow": flow}
+            except Exception as exc:
+                self.observability.record_exception(
+                    exc,
+                    input={"history_event_count": len(state.get("exploration_history", []))},
+                    context={"workflow_name": state.get("task", ""), "active_action": "Flow Generation"},
+                )
+                raise
 
     def invoke(self, state: QAState) -> QAState:
         """Run generation after Discovery has completed successfully."""
         return self.graph.invoke(state)
 
 
-def build_generation_graph(flow_generator: FlowGenerator | None = None):
+def build_generation_graph(
+    flow_generator: FlowGenerator | None = None,
+    observability: ObservabilityBackend | None = None,
+):
     """Return a compiled Generation Graph for direct LangGraph composition."""
-    return GenerationGraph(flow_generator).graph
+    return GenerationGraph(flow_generator, observability).graph

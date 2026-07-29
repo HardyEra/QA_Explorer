@@ -26,6 +26,8 @@ class BrowserController:
         self.follow_external = False
         self.base_domain = None
         self.observability = NoopObservability()
+        self.latest_screenshot_path = None
+        self.workflow_name = None
 
     def start(self, observability=None):
         self.observability = observability or NoopObservability()
@@ -65,6 +67,12 @@ class BrowserController:
                 self.observability.record_exception(
                     exc,
                     input={"action": action, "selector": selector, "page_url": initial_url},
+                    context={
+                        "current_url": initial_url,
+                        "workflow_name": self.workflow_name,
+                        "active_action": action,
+                        "screenshot_path": self.latest_screenshot_path,
+                    },
                 )
                 raise
             finally:
@@ -137,7 +145,9 @@ class BrowserController:
 
     def screenshot(self, path):
         """Save a screenshot at a caller-provided absolute or relative path."""
-        self.page.screenshot(path=path)
+        with self._browser_action("screenshot", selector=str(path)):
+            self.page.screenshot(path=path)
+        self.latest_screenshot_path = str(path)
 
     def close(self):
         if self.browser:
@@ -319,7 +329,14 @@ class BrowserController:
         except (Error, TimeoutError) as exc:
             logger.exception("Failed to click action %s: %s", action_id, exc)
             self.observability.record_exception(
-                exc, input={"action": "click", "selector": str(action_id), "page_url": self.page.url}
+                exc,
+                input={"action": "click", "selector": str(action_id), "page_url": self.page.url},
+                context={
+                    "current_url": self.page.url,
+                    "workflow_name": self.workflow_name,
+                    "active_action": action.get("text") if action else str(action_id),
+                    "screenshot_path": self.latest_screenshot_path,
+                },
             )
             print(f"Failed to click action {action_id}")
             return False
@@ -343,7 +360,14 @@ class BrowserController:
                 return True
             except Exception as exc:
                 self.observability.record_exception(
-                    exc, input={"action": "fill", "selector": target, "page_url": self.page.url}
+                    exc,
+                    input={"action": "fill", "selector": target, "page_url": self.page.url},
+                    context={
+                    "current_url": self.page.url,
+                    "workflow_name": self.workflow_name,
+                    "active_action": target,
+                        "screenshot_path": self.latest_screenshot_path,
+                    },
                 )
                 pass
 

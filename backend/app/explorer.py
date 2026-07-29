@@ -41,6 +41,9 @@ class Explorer:
         self.browser = browser
         self.config = config
         self.observability = observability
+        # Browser-level errors need the workflow name even when they occur
+        # below an Explorer node's tracing context.
+        self.browser.workflow_name = config.current_goal
         self.planner = Planner(observability)
         self.executor = Executor(browser, observability)
         self.memory = ExplorationMemory()
@@ -352,7 +355,15 @@ class Explorer:
                 result["exploration_history"] = self.execution_history
                 return result
         except Exception as exc:
-            self.observability.record_exception(exc, input={"start_url": self.config.start_url})
+            self.observability.record_exception(
+                exc,
+                input={"start_url": self.config.start_url},
+                context={
+                    "current_url": self.browser.current_url() if self.browser.page else self.config.start_url,
+                    "workflow_name": self.config.current_goal,
+                    "screenshot_path": getattr(self.browser, "latest_screenshot_path", None),
+                },
+            )
             raise
         finally:
             self.observability.flush()

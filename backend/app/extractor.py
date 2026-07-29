@@ -299,7 +299,107 @@ class PageExtractor:
 
                     continue
 
+        # Design-system option cards are frequently implemented as a ``div``
+        # with a framework event handler. They therefore expose only a
+        # paragraph/StaticText in the accessibility tree (for example,
+        # "Client"), not a button or link. Register the visible label as the
+        # click target: a normal Playwright click on that text bubbles to the
+        # card handler without needing a force click or implementation-specific
+        # CSS selector.
+        actions.extend(self._dialog_option_actions())
+
         return actions
+
+    def _dialog_option_actions(self):
+        """Find visible, card-like choices in a dialog with missing semantics.
+
+        This is intentionally scoped to dialogs and requires a compact leaf
+        paragraph inside a card-sized ancestor. It avoids turning explanatory
+        modal copy or the dialog title into planner actions while supporting
+        custom React/Vue option cards with no ARIA click role.
+        """
+        actions = []
+        seen_labels = set()
+        option_labels = self.page.locator("p, [role='paragraph']")
+
+        for element in option_labels.all():
+            try:
+                if not self._is_actionable_element(element):
+                    continue
+                text = self._safe_text(element)
+                normalized = self._normalise_label(text).casefold()
+                if not self._is_meaningful_label(text) or normalized in seen_labels:
+                    continue
+                if not self._is_dialog_card_label(element):
+                    continue
+
+                action_id = self.action_registry.register(
+                    locator=element,
+                    text=text,
+                    action_type="dialog_option",
+                )
+                actions.append(
+                    Action(
+                        id=action_id,
+                        text=text,
+                        type="dialog_option",
+                        **self._action_context(element),
+                    )
+                )
+                seen_labels.add(normalized)
+                logger.info("Discovered custom dialog option: %s", text)
+            except Exception as exc:
+                logger.debug("Skipping custom dialog option: %s", exc)
+
+        return actions
+
+    @staticmethod
+    def _is_dialog_card_label(element):
+        """Return whether a paragraph is the label of a visual dialog option."""
+        try:
+            return bool(element.evaluate("""node => {
+                let dialog = node.closest('[role="dialog"], dialog');
+                // Some custom modals omit role=dialog. Recognise only a
+                // centred, overlay-like panel as a fallback, never an
+                // arbitrary application container.
+                if (!dialog) {
+                    for (let current = node.parentElement; current; current = current.parentElement) {
+                        const rect = current.getBoundingClientRect();
+                        const style = window.getComputedStyle(current);
+                        const centered = Math.abs((rect.left + rect.width / 2) - window.innerWidth / 2)
+                            <= window.innerWidth * 0.2;
+                        const panelSized = rect.width >= 240 && rect.width <= window.innerWidth * 0.85
+                            && rect.height >= 120 && rect.height <= window.innerHeight * 0.9;
+                        const overlayLayer = style.position === 'fixed' || style.position === 'absolute'
+                            || Number.parseInt(style.zIndex || '0', 10) > 0;
+                        if (centered && panelSized && overlayLayer) {
+                            dialog = current;
+                            break;
+                        }
+                    }
+                }
+                if (!dialog || node.children.length || !node.textContent.trim()) return false;
+                const dialogRect = dialog.getBoundingClientRect();
+                const text = node.textContent.trim();
+                for (let current = node.parentElement;
+                     current && current !== dialog;
+                     current = current.parentElement) {
+                    const rect = current.getBoundingClientRect();
+                    const style = window.getComputedStyle(current);
+                    const actionHint = current.matches(
+                        'button, a, [role="button"], [role="link"], [onclick], [tabindex]'
+                    ) || style.cursor === 'pointer';
+                    const cardSized = rect.width >= 72 && rect.height >= 72
+                        && rect.width <= dialogRect.width * 0.7
+                        && rect.height <= dialogRect.height * 0.9;
+                    const hasVisualChoice = Boolean(current.querySelector('img, svg'))
+                        && current.innerText.trim() === text;
+                    if (actionHint || (cardSized && hasVisualChoice)) return true;
+                }
+                return false;
+            }"""))
+        except Exception:
+            return False
 
     @staticmethod
     def _is_actionable_element(element, action_type=None):

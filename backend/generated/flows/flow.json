@@ -1,6 +1,6 @@
 {
-  "flow_name": "Fill Log In",
-  "description": "User journey: fill Email, fill Password, click Log In.",
+  "flow_name": "Fill Add New",
+  "description": "User journey: fill Email, fill Password, click Log In, click Clients, click Add New.",
   "pages": [
     "Otomashen ATS"
   ],
@@ -18,6 +18,14 @@
     {
       "type": "click",
       "target": "Log In"
+    },
+    {
+      "type": "click",
+      "target": "Clients"
+    },
+    {
+      "type": "click",
+      "target": "Add New"
     }
   ]
 }

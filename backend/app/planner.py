@@ -544,6 +544,11 @@ class Planner:
         visited_actions_text = "\n".join(visited_actions) or "None"
 
         self._activate_workflow(config)
+        exception_context = {
+            "current_url": getattr(getattr(observation, "page", None), "url", None),
+            "workflow_name": getattr(config, "current_goal", None),
+            "active_action": "Plan",
+        }
         decision_actions = self._decision_candidates(observation.actions)
         actions = json.dumps(
             [
@@ -659,7 +664,9 @@ JSON Format:
                     response_format={"type": "json_object"},
                 )
             except Exception as exc:
-                self.observability.record_exception(exc, input=prompt, retry_count=0)
+                self.observability.record_exception(
+                    exc, input=prompt, retry_count=0, context=exception_context
+                )
                 logger.exception("Groq plan request failed; switching to local fallback planning")
                 self.remote_planning_available = False
                 return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
@@ -670,13 +677,17 @@ JSON Format:
             try:
                 plan = json.loads(content)
             except json.JSONDecodeError as exc:
-                self.observability.record_exception(exc, input=prompt, output=content, retry_count=0)
+                self.observability.record_exception(
+                    exc, input=prompt, output=content, retry_count=0, context=exception_context
+                )
                 logger.warning("Groq returned invalid JSON; using local fallback plan")
                 return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
 
             if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
                 exc = ValueError("Groq returned an invalid plan shape")
-                self.observability.record_exception(exc, input=prompt, output=content, retry_count=0)
+                self.observability.record_exception(
+                    exc, input=prompt, output=content, retry_count=0, context=exception_context
+                )
                 logger.warning("Groq returned an invalid plan shape; using local fallback plan")
                 return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
 
