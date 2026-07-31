@@ -398,6 +398,21 @@ class BrowserController:
                 logger.warning("Failed to upload test asset to file input %s: %s", index, exc)
         return uploaded
 
+    def upload_file_action(self, action_id, file_path):
+        """Attach a file to the exact file input selected by the planner."""
+        action = self.action_registry.get(action_id)
+        if action is None or action.get("type") != "file_upload":
+            logger.warning("Action %s is not a registered file-upload control", action_id)
+            return False
+        try:
+            with self._browser_action("upload_file", str(file_path)):
+                action["locator"].set_input_files(str(file_path))
+            logger.info("Uploaded test asset %s using action %s", file_path, action_id)
+            return True
+        except (Error, TimeoutError) as exc:
+            logger.warning("Failed to upload test asset using action %s: %s", action_id, exc)
+            return False
+
     def has_file_inputs(self):
         """Return whether the current page exposes an HTML file input."""
         try:

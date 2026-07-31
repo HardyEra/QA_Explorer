@@ -1,14 +1,32 @@
 {
-  "flow_name": "Fill Candidates",
-  "description": "User journey: fill Email, fill Password, click Log In, click Candidates.",
+  "flow_name": "Click Upload Resume(s)",
+  "description": "User journey: click Login, fill Username, fill Password, click Login, fill Email, fill Password, click Log In, click Candidate, click Candidates, click Add Candidate, click Upload Resume(s).",
   "pages": [
     "Otomashen ATS"
   ],
   "steps": [
     {
+      "type": "click",
+      "target": "Login"
+    },
+    {
+      "type": "fill",
+      "target": "Username",
+      "value": "johnny_101@mail.com"
+    },
+    {
+      "type": "fill",
+      "target": "Password",
+      "value": "Qatest@12"
+    },
+    {
+      "type": "click",
+      "target": "Login"
+    },
+    {
       "type": "fill",
       "target": "Email",
-      "value": "johnny@mail.com"
+      "value": "johnny_101@mail.com"
     },
     {
       "type": "fill",
@@ -21,7 +39,19 @@
     },
     {
       "type": "click",
+      "target": "Candidate"
+    },
+    {
+      "type": "click",
       "target": "Candidates"
+    },
+    {
+      "type": "click",
+      "target": "Add Candidate"
+    },
+    {
+      "type": "click",
+      "target": "Upload Resume(s)"
     }
   ]
 }

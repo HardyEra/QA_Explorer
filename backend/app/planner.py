@@ -558,6 +558,8 @@ class Planner:
                     "text": action.text,
                     "category": action.category,
                     "priority": action.priority,
+                    "context": getattr(action, "context", "page"),
+                    "container": getattr(action, "container", None),
                 }
                 for action in decision_actions
             ],
@@ -579,6 +581,12 @@ Title:
 
 URL:
 {observation.page.url}
+
+Current UI Context:
+{getattr(observation, "ui_context", "NORMAL_PAGE")}
+
+Active Container:
+{getattr(observation, "active_container", None) or "None"}
 
 Available Inputs:
 {inputs}

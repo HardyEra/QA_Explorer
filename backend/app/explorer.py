@@ -268,7 +268,30 @@ class Explorer:
 
     @traced_node("Planner Candidate Selection")
     def _select_candidates(self, state: ExplorationState) -> dict[str, Any]:
-        candidates = state["ranked_actions"][:self.config.max_planner_actions]
+        ranked_actions = state["ranked_actions"]
+        candidates = ranked_actions[:self.config.max_planner_actions]
+
+        # Ranking happens before the planner activates workflow memory.  On a
+        # dense dashboard, this can put a requested module such as Candidates
+        # or Clients just below the normal candidate limit, even though it is
+        # the only valid next step. Keep explicit workflow targets in the
+        # candidate set; the planner will still enforce its normal hard gate.
+        self.planner._activate_workflow(self.config)
+        workflow = self.planner.workflow_memory
+        if workflow and not workflow.target_reached:
+            targets = [
+                action for action in ranked_actions
+                if self.planner._is_target_action(action)
+            ]
+            if targets:
+                candidate_ids = {action.id for action in candidates}
+                promoted = [action for action in targets if action.id not in candidate_ids]
+                if promoted:
+                    candidates = [*promoted, *candidates]
+                    logger.info(
+                        "Promoted explicit workflow target(s) beyond planner limit: %s",
+                        ", ".join(action.text for action in promoted),
+                    )
         logger.info("Planner Candidates")
         for position, action in enumerate(candidates, start=1):
             logger.info("%s. %s (%s)", position, action.text, action.priority)

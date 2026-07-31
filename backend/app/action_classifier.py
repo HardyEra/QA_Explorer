@@ -102,6 +102,8 @@ class ClassifiedAction:
     type: str
     category: str
     priority: int
+    context: str = "page"
+    container: str | None = None
 
     @classmethod
     def from_action(cls, action: Action, category: str) -> "ClassifiedAction":
@@ -111,6 +113,8 @@ class ClassifiedAction:
             type=action.type,
             category=category,
             priority=CATEGORY_PRIORITY[category],
+            context=action.context,
+            container=action.container,
         )
 
 
@@ -118,6 +122,8 @@ class ActionClassifier:
     """Classify visible action labels using an extensible keyword mapping."""
 
     def classify(self, action: Action) -> ClassifiedAction:
+        if action.type == "file_upload":
+            return ClassifiedAction.from_action(action, "upload")
         normalized_text = self._semantic_text(action)
         text_category = next(
             (
@@ -153,6 +159,8 @@ class ActionClassifier:
     def _context_category(action: Action, text_category: str) -> str:
         """Use extracted layout semantics when text alone is ambiguous."""
         context = (action.container_context or "").casefold()
+        if action.context == "modal" and text_category == "unknown":
+            return "dialog_action"
         # A header avatar/menu is account navigation even if its label is only
         # an icon name. Preserve explicit authentication and logout intent.
         if context == "profile" and text_category not in {"authentication", "logout"}:
@@ -180,6 +188,7 @@ class ActionRanker:
         "filter", "candidate_card", "social", "footer", "help", "external",
         "navigation_module", "toolbar_action", "header_action",
     }
+    OVERLAY_ACTION_BONUS = 1_000
 
     def __init__(self) -> None:
         self._previous_action_keys: set[tuple[str, str, str]] | None = None
@@ -199,6 +208,11 @@ class ActionRanker:
         ranked = []
         for action in actions:
             score = self._score(action)
+            if action.context in {"modal", "drawer", "popover"}:
+                # An overlay is the active interaction surface.  This keeps
+                # actions from that surface ahead of persistent navigation if
+                # a caller intentionally retains any background candidates.
+                score += self.OVERLAY_ACTION_BONUS
             key = self._action_key(action)
             if key in new_keys and action.category not in self.PERSISTENT_UI_CATEGORIES:
                 score += self.NEW_ACTION_BONUS

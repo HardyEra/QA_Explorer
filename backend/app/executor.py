@@ -19,17 +19,6 @@ class Executor:
         self.asset_manager = AssetManager()
 
     def execute(self, plan):
-        if self.browser.has_file_inputs():
-            resume_path = self.asset_manager.resolve_resume_path()
-            if resume_path:
-                upload_action = {"type": "upload"}
-                before_upload = self.browser.capture_action_state(upload_action)
-                if self.browser.upload_file_inputs(resume_path):
-                    logger.info("Uploaded stored resume to page file input")
-                    self.browser.wait_after_action(upload_action, before_upload)
-            else:
-                logger.warning("Resume upload skipped because no stored resume is available")
-
         for step in plan["steps"]:
             print(step)
             before_state = self.browser.capture_action_state(step)
@@ -50,9 +39,18 @@ class Executor:
                     return False
                 source_url = self.browser.current_url()
                 action_details = self.browser.get_action(action_id) or {}
-                success = self.browser.click_action(action_id)
+                if action_details.get("type") == "file_upload":
+                    resume_path = self.asset_manager.resolve_resume_path()
+                    if not resume_path:
+                        logger.error("File upload action selected, but no resume asset is available")
+                        return False
+                    success = self.browser.upload_file_action(action_id, resume_path)
+                    if success:
+                        logger.info("Uploaded stored resume through selected file-upload action")
+                else:
+                    success = self.browser.click_action(action_id)
 
-                if not success:
+                if not success and action_details.get("type") != "file_upload":
                     success = self._recover_intercepted_click(action_id)
                 if not success:
                     logger.error(

@@ -27,6 +27,84 @@ class PageExtractor:
         self.deduplicator = ActionDeduplicator()
         self.accessibility_extractor = AccessibilityExtractor(page, action_registry)
         self.page_summary_generator = PageSummaryGenerator()
+        self._overlay = {"ui_context": "NORMAL_PAGE", "action_context": "page", "container": None, "selector": None}
+
+    def _detect_active_overlay(self):
+        """Identify the top-most visible interaction surface without UI-library coupling.
+
+        Framework selectors are only signals: ARIA roles, visibility, viewport
+        geometry and stacking order decide which surface is active.  The
+        returned selector scopes later locator queries, including React portals
+        mounted outside the application's root node.
+        """
+        try:
+            overlay = self.page.evaluate("""() => {
+                const visible = node => {
+                    const style = getComputedStyle(node), rect = node.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+                };
+                const selectorFor = node => {
+                    const parts = [];
+                    for (let current = node; current && current.nodeType === 1 && current !== document.body; current = current.parentElement) {
+                        let part = current.tagName.toLowerCase();
+                        if (current.id) { part += '#' + CSS.escape(current.id); parts.unshift(part); break; }
+                        let index = 1, sibling = current;
+                        while ((sibling = sibling.previousElementSibling)) if (sibling.tagName === current.tagName) index++;
+                        part += `:nth-of-type(${index})`;
+                        parts.unshift(part);
+                    }
+                    return 'body > ' + parts.join(' > ');
+                };
+                const titleFor = node => {
+                    const labelled = (node.getAttribute('aria-labelledby') || '').split(/\\s+/)
+                        .map(id => document.getElementById(id)?.innerText || '').filter(Boolean).join(' ');
+                    const heading = node.querySelector('[role="heading"], h1, h2, h3, h4, h5, h6');
+                    return (labelled || node.getAttribute('aria-label') || heading?.innerText || '').replace(/\\s+/g, ' ').trim() || null;
+                };
+                const candidates = [];
+                const add = (node, kind, signal) => {
+                    if (!node || !visible(node) || node.classList.contains('MuiBackdrop-root')) return;
+                    const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+                    const z = Number.parseFloat(style.zIndex) || 0;
+                    // A presentation element is often a wrapper. It is a
+                    // surface only when it has dialog-like content or is a
+                    // full-screen overlay layer.
+                    if (signal === 'presentation' && !node.querySelector('[role="dialog"], dialog, [aria-modal="true"]')
+                        && !(rect.width >= innerWidth * .8 && rect.height >= innerHeight * .8 && z > 0)) return;
+                    candidates.push({node, kind, signal, z, area: rect.width * rect.height, order: candidates.length});
+                };
+                document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]').forEach(n => add(n, 'MODAL', 'dialog'));
+                document.querySelectorAll('.MuiModal-root, .MuiDrawer-root, .MuiPopover-root, [data-radix-popper-content-wrapper], [data-headlessui-state]').forEach(n => {
+                    const classes = n.className?.toString() || '';
+                    add(n, /Drawer/i.test(classes) ? 'DRAWER' : /Popover|popper/i.test(classes) ? 'POPOVER' : 'MODAL', 'library');
+                });
+                document.querySelectorAll('[role="presentation"]').forEach(n => add(n, 'MODAL', 'presentation'));
+                // Generic portals: a hidden application root plus locked body
+                // is strong evidence that an outside-root child is the active overlay.
+                const rootHidden = document.querySelector('#root[aria-hidden="true"]');
+                const locked = /overflow\\s*:\\s*hidden/i.test(document.body.getAttribute('style') || '')
+                    || getComputedStyle(document.body).overflow === 'hidden';
+                if (rootHidden && locked) {
+                    Array.from(document.body.children).filter(n => n !== rootHidden).forEach(n => add(n, 'MODAL', 'portal'));
+                }
+                if (!candidates.length) return {ui_context: 'NORMAL_PAGE', action_context: 'page', container: null, selector: null};
+                candidates.sort((a, b) => b.z - a.z || b.order - a.order || a.area - b.area);
+                const best = candidates[0];
+                return {ui_context: best.kind, action_context: best.kind.toLowerCase(), container: titleFor(best.node), selector: selectorFor(best.node), signal: best.signal};
+            }""")
+            if overlay["ui_context"] != "NORMAL_PAGE":
+                logger.info("Overlay detected: %s (%s)", overlay.get("signal", "generic overlay"), overlay["ui_context"])
+                logger.info("Context: %s", overlay["ui_context"])
+                logger.info("Extracting actions only from active %s.", overlay["action_context"])
+            return overlay
+        except Exception as exc:
+            logger.debug("Overlay detection failed; using page surface: %s", exc)
+            return {"ui_context": "NORMAL_PAGE", "action_context": "page", "container": None, "selector": None}
+
+    def _surface(self):
+        selector = self._overlay.get("selector")
+        return self.page.locator(selector) if selector else self.page.locator("body")
     # --------------------------
     # Safe helpers
     # --------------------------
@@ -162,7 +240,7 @@ class PageExtractor:
 
         inputs = []
 
-        for element in self.page.locator("input").all():
+        for element in self._surface().locator("input").all():
 
             try:
                 inputs.append({
@@ -184,7 +262,7 @@ class PageExtractor:
 
         buttons = []
 
-        locator = self.page.locator(
+        locator = self._surface().locator(
             "button, input[type='submit'], input[type='button']"
         )
 
@@ -205,7 +283,7 @@ class PageExtractor:
 
         forms = []
 
-        for form in self.page.locator("form").all():
+        for form in self._surface().locator("form").all():
 
             try:
 
@@ -253,9 +331,14 @@ class PageExtractor:
         selectors = {
             "link": "a",
             "button": "button, input[type='submit'], input[type='button']",
+            # Native file inputs are often visually styled by a companion
+            # label/button. They are still the reliable Playwright target for
+            # a user-supplied asset and must remain within the active overlay.
+            "file_upload": "input[type='file']",
             "clickable": (
                 "[role='button'], [role='link'], [role='menuitem'], [role='treeitem'], "
-                "[role='option'], [onclick], [tabindex], div[role='button']"
+                "[role='option'], [onclick], [tabindex], [class~='cursor-pointer'], "
+                "[class*='cursor-pointer'], [style*='cursor: pointer'], div, span"
             ),
             # Some applications attach React handlers directly to an SVG menu
             # icon. ``_semantic_icon_label`` filters this broad selector down
@@ -265,7 +348,7 @@ class PageExtractor:
 
         for action_type, selector in selectors.items():
 
-            for element in self.page.locator(selector).all():
+            for element in self._surface().locator(selector).all():
 
                 try:
                     # Do not plan clicks on hidden menu entries, modals, or
@@ -273,7 +356,11 @@ class PageExtractor:
                     if not self._is_actionable_element(element, action_type):
                         continue
 
-                    text = self._safe_text(element) or self._semantic_icon_label(element)
+                    text = (
+                        self._safe_text(element)
+                        or ("Choose Files" if action_type == "file_upload" else "")
+                        or self._semantic_icon_label(element)
+                    )
 
                     if not text:
                         continue
@@ -290,6 +377,8 @@ class PageExtractor:
                             text=text,
                             type=action_type,
                             **self._action_context(element),
+                            context=self._overlay["action_context"],
+                            container=self._overlay.get("container"),
                         )
                     )
 
@@ -308,6 +397,14 @@ class PageExtractor:
         # CSS selector.
         actions.extend(self._dialog_option_actions())
 
+        if self._overlay["ui_context"] != "NORMAL_PAGE":
+            logger.info(
+                "%s actions found: %s",
+                self._overlay["action_context"].capitalize(),
+                ", ".join(action.text for action in actions) or "None",
+            )
+            logger.info("Background actions suppressed: active overlay is the only extraction surface")
+
         return actions
 
     def _dialog_option_actions(self):
@@ -320,7 +417,7 @@ class PageExtractor:
         """
         actions = []
         seen_labels = set()
-        option_labels = self.page.locator("p, [role='paragraph']")
+        option_labels = self._surface().locator("p, [role='paragraph']")
 
         for element in option_labels.all():
             try:
@@ -344,6 +441,8 @@ class PageExtractor:
                         text=text,
                         type="dialog_option",
                         **self._action_context(element),
+                        context=self._overlay["action_context"],
+                        container=self._overlay.get("container"),
                     )
                 )
                 seen_labels.add(normalized)
@@ -410,11 +509,11 @@ class PageExtractor:
         aria-hidden or tabindex=-1, and they must never become planner actions.
         """
         try:
-            if not element.is_visible():
+            if action_type != "file_upload" and not element.is_visible():
                 return False
             if action_type == "icon":
                 return True
-            if (element.get_attribute("aria-hidden") or "").casefold() == "true":
+            if action_type != "file_upload" and (element.get_attribute("aria-hidden") or "").casefold() == "true":
                 return False
             if element.get_attribute("disabled") is not None:
                 return False
@@ -423,7 +522,34 @@ class PageExtractor:
                 return False
             if (element.evaluate("node => node.tagName.toLowerCase()") or "") == "input":
                 input_type = (element.get_attribute("type") or "text").casefold()
-                if input_type in {"hidden", "file"}:
+                if input_type == "hidden" or (input_type == "file" and action_type != "file_upload"):
+                    return False
+            if action_type == "clickable":
+                # React commonly delegates handlers, so a listener is not
+                # reliably introspectable. These are the framework-neutral DOM
+                # interaction signals that remain observable.
+                interactive = element.evaluate("""node => {
+                    const style = getComputedStyle(node);
+                    return node.hasAttribute('onclick') || typeof node.onclick === 'function'
+                        || node.matches('[role="button"], [role="link"], [role="menuitem"], [role="treeitem"], [role="option"]')
+                        || node.tabIndex >= 0 || style.cursor === 'pointer'
+                        || /(^|\\s)cursor-pointer(\\s|$)/.test(node.className?.toString() || '');
+                }""")
+                if not interactive:
+                    return False
+                # A pointer-styled layout wrapper can contain several real
+                # controls. Registering it produces a concatenated label such
+                # as "Log In ... Forgot Password ... Log In" and competes with
+                # the controls a user can actually identify. Keep leaf divs
+                # (including ``div.cursor-pointer`` upload targets), but let a
+                # semantic descendant own the interaction when one exists.
+                if element.evaluate("""node => {
+                    const tag = node.tagName.toLowerCase();
+                    return (tag === 'div' || tag === 'span') && Boolean(node.querySelector(
+                        'button, a, input, select, textarea, [role="button"], [role="link"], '
+                        + '[role="menuitem"], [role="treeitem"], [role="option"], [onclick], [tabindex]'
+                    ));
+                }"""):
                     return False
             return True
         except Exception:
@@ -475,12 +601,17 @@ class PageExtractor:
     def observe(self):
 
         self.action_registry.clear()
+        self._overlay = self._detect_active_overlay()
 
         # The accessibility tree is the primary source of page semantics, but
         # it may omit custom sidebar/menu controls exposed by component
         # libraries. Supplement it with meaningful DOM actions instead of
         # losing a workflow entry point such as a navigation module.
-        accessibility = self.accessibility_extractor.extract()
+        # AX snapshots describe the whole document and cannot reliably map a
+        # portal action back to its owning DOM subtree.  For an active overlay,
+        # DOM extraction is both more complete (custom div click targets) and
+        # safely scoped to the interaction surface.
+        accessibility = None if self._overlay["ui_context"] != "NORMAL_PAGE" else self.accessibility_extractor.extract()
         if accessibility is not None:
             page = Page(title=self.page.title(), url=self.page.url)
             accessibility_labels = {
@@ -508,6 +639,8 @@ class PageExtractor:
                 accessibility_tree=accessibility.tree,
                 page_summary=self.page_summary_generator.generate(page.title, accessibility.tree),
                 page_title=page.title,
+                ui_context=self._overlay["ui_context"],
+                active_container=self._overlay.get("container"),
             )
 
         return Observation(
@@ -523,4 +656,6 @@ class PageExtractor:
             accessibility_tree=[],
             page_summary="",
             page_title=self.page.title(),
+            ui_context=self._overlay["ui_context"],
+            active_container=self._overlay.get("container"),
         )
