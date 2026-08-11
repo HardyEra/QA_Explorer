@@ -1,0 +1,59 @@
+{
+  "flow_name": "Fill Delete Candidate",
+  "description": "User journey: fill Email, fill Password, click Log In, click Candidates, click Add Candidate, click Upload Resume(s), click Choose Files, click Confirm & Create Candidates, click Edit Candidate, click Next, click Candidates, click Delete Candidate.",
+  "pages": [
+    "Otomashen ATS"
+  ],
+  "steps": [
+    {
+      "type": "fill",
+      "target": "Email",
+      "value": "johnny_101@mail.com"
+    },
+    {
+      "type": "fill",
+      "target": "Password",
+      "value": "Qatest@12"
+    },
+    {
+      "type": "click",
+      "target": "Log In"
+    },
+    {
+      "type": "click",
+      "target": "Candidates"
+    },
+    {
+      "type": "click",
+      "target": "Add Candidate"
+    },
+    {
+      "type": "click",
+      "target": "Upload Resume(s)"
+    },
+    {
+      "type": "click",
+      "target": "Choose Files"
+    },
+    {
+      "type": "click",
+      "target": "Confirm & Create Candidates"
+    },
+    {
+      "type": "click",
+      "target": "Edit Candidate"
+    },
+    {
+      "type": "click",
+      "target": "Next"
+    },
+    {
+      "type": "click",
+      "target": "Candidates"
+    },
+    {
+      "type": "click",
+      "target": "Delete Candidate"
+    }
+  ]
+}

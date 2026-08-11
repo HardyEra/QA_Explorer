@@ -20,3 +20,14 @@ test-results/
 # Runtime logs
 backend/logs/
 backend/runtime/
+backend/agent.log
+
+# Generated and user-provided runtime data
+backend/generated/
+backend/screenshots/
+backend/uploads/
+
+# Test and tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage

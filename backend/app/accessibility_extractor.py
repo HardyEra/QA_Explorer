@@ -18,6 +18,13 @@ from models import Action
 
 logger = logging.getLogger(__name__)
 
+_UTILITY_ACTION_LABEL = re.compile(
+    r"^(?:[a-z-]+:)*(?:p|px|py|pt|pr|pb|pl|m|mx|my|mt|mr|mb|ml|w|h|text|bg|border|rounded|shadow|z)(?:-|\[)",
+    re.IGNORECASE,
+)
+_UTILITY_ACTION_WORDS = {"block", "flex", "grid", "fixed", "absolute", "relative", "hidden"}
+_GENERATED_ACTION_LABEL = re.compile(r"^[a-z0-9_-]{20,}$", re.IGNORECASE)
+
 USEFUL_ROLES = {
     "button", "link", "textbox", "checkbox", "radio", "combobox",
     "menuitem", "dialog", "heading", "form",
@@ -70,7 +77,7 @@ class AccessibilityExtractor:
         actions: list[Action] = []
         useful_tree: list[dict[str, Any]] = []
         for node in tree:
-            useful_tree.extend(self._walk(node, inputs, forms, actions))
+            useful_tree.extend(self._walk(node, inputs, forms, actions, []))
         if not useful_tree:
             logger.warning("Accessibility snapshot contained no useful nodes; using DOM fallback")
             return None
@@ -160,10 +167,11 @@ class AccessibilityExtractor:
         inputs: list[dict[str, Any]],
         forms: list[dict[str, Any]],
         actions: list[Action],
+        ancestors: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         children: list[dict[str, Any]] = []
         for child in node.get("children") or []:
-            children.extend(self._walk(child, inputs, forms, actions))
+            children.extend(self._walk(child, inputs, forms, actions, [*ancestors, node]))
 
         role = node.get("role")
         if role not in USEFUL_ROLES:
@@ -176,7 +184,7 @@ class AccessibilityExtractor:
         if role == "form":
             forms.append(cleaned)
         if role in ACTIONABLE_ROLES and name and not cleaned.get("disabled", False):
-            action = self._action_for(cleaned)
+            action = self._action_for(cleaned, ancestors)
             if action:
                 actions.append(action)
         return [cleaned]
@@ -214,15 +222,61 @@ class AccessibilityExtractor:
             **({"expanded": node["expanded"]} if "expanded" in node else {}),
         }
 
-    def _action_for(self, node: dict[str, Any]) -> Action | None:
+    def _action_for(self, node: dict[str, Any], ancestors: list[dict[str, Any]]) -> Action | None:
         role, name = node["role"], node["name"]
+        if not self._is_meaningful_action_label(name):
+            return None
         try:
             locator = self._role_locator(role, name)
             action_id = self.action_registry.register(locator=locator, text=name, action_type=role)
-            return Action(id=action_id, text=name, type=role)
+            return Action(
+                id=action_id,
+                text=name,
+                type=role,
+                role=role,
+                parent_role=ancestors[-1].get("role") if ancestors else None,
+                container_context=self._container_context(ancestors),
+                ancestor_tags=[ancestor.get("role", "") for ancestor in ancestors[-5:]],
+                aria_role=role,
+                tag_name=None,
+            )
         except Exception as exc:
             logger.debug("Skipping accessibility action %s %r: %s", role, name, exc)
             return None
+
+    @staticmethod
+    def _is_meaningful_action_label(name: str) -> bool:
+        label = " ".join(name.split())
+        if not label:
+            return False
+        normalized = label.casefold()
+        if normalized in _UTILITY_ACTION_WORDS or _UTILITY_ACTION_LABEL.match(normalized):
+            return False
+        if normalized.startswith(("hover:", "focus:", "active:", "fixed bottom", "block ")):
+            return False
+        return not _GENERATED_ACTION_LABEL.fullmatch(normalized)
+
+    @staticmethod
+    def _container_context(ancestors: list[dict[str, Any]]) -> str | None:
+        roles = [str(ancestor.get("role", "")).casefold() for ancestor in ancestors]
+        names = " ".join(str(ancestor.get("name", "")).casefold() for ancestor in ancestors)
+        if any(term in names for term in ("avatar", "profile", "account", "user")):
+            return "profile"
+        if "dialog" in roles:
+            return "dialog"
+        if "form" in roles:
+            return "form"
+        if "navigation" in roles:
+            return "navigation"
+        if "complementary" in roles:
+            return "sidebar"
+        if "toolbar" in roles:
+            return "toolbar"
+        if "menu" in roles or "menubar" in roles:
+            return "menu"
+        if "banner" in roles:
+            return "header"
+        return None
 
     def _role_locator(self, role: str, name: str):
         """Create a stable locator for duplicate role/name controls in tree order."""

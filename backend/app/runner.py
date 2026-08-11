@@ -110,7 +110,7 @@ def run_exploration(
             "generated_script": None,
             "readme": None,
         }
-        generation_result = GenerationGraph().invoke(generation_state)
+        generation_result = GenerationGraph(observability=observability).invoke(generation_state)
         result = {**result, "flow": generation_result["flow"]}
         callback({"type": "completed", "status": "Exploration complete", "url": browser.current_url(), "mode": mode})
         return result
@@ -120,4 +120,9 @@ def run_exploration(
         raise
     finally:
         logging.getLogger().removeHandler(handler)
-        browser.close()
+        try:
+            browser.close()
+        finally:
+            # Always drain queued telemetry, including failures before Explorer
+            # can reach its own cleanup path.
+            observability.flush()

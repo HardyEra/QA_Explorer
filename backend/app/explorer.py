@@ -13,6 +13,7 @@ from planner import Planner
 from action_classifier import ActionClassifier, ActionRanker, ClassifiedAction
 from observability.decorators import traced_node
 from observability.tracing import TraceMetadata
+from vision_observer import VisionObserver
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,11 @@ class Explorer:
         self.browser = browser
         self.config = config
         self.observability = observability
+        # Browser-level errors need the workflow name even when they occur
+        # below an Explorer node's tracing context.
+        self.browser.workflow_name = config.current_goal
         self.planner = Planner(observability)
+        self.vision_observer = VisionObserver(observability=observability)
         self.executor = Executor(browser, observability)
         self.memory = ExplorationMemory()
         # This is the single canonical, serializable record of Discovery's
@@ -93,7 +98,11 @@ class Explorer:
             self._action_route,
             {"plan": "plan", "complete": END},
         )
-        workflow.add_edge("plan", "execute")
+        workflow.add_conditional_edges(
+            "plan",
+            self._plan_route,
+            {"execute": "execute", "complete": END},
+        )
         workflow.add_edge("execute", "record_result")
         workflow.add_edge("record_result", "observe")
 
@@ -102,12 +111,50 @@ class Explorer:
     @traced_node("Discovery Agent.observe")
     def _observe(self, state: ExplorationState) -> ExplorationState:
         observation = self.browser.observe()
+        # Vision is supplementary perception: a Gemini outage, missing key,
+        # or invalid model response must never prevent DOM-first exploration.
+        if self.vision_observer.api_key:
+            try:
+                observation.vision_observation = self.vision_observer.observe(self.browser.page)
+                logger.info(
+                    "Vision observation attached: page_type=%s dialogs=%s buttons=%s",
+                    observation.vision_observation.page_type,
+                    len(observation.vision_observation.dialogs),
+                    len(observation.vision_observation.buttons),
+                )
+            except Exception as exc:
+                logger.warning("Vision observation unavailable; continuing without it: %s", exc)
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    # Quota will not recover mid-run; stop paying a failed
+                    # request's latency on every remaining observation.
+                    logger.warning("Vision disabled for the rest of this run (quota exhausted)")
+                    self.vision_observer.api_key = None
+        else:
+            logger.info("Vision observation skipped: GEMINI_API_KEY is not configured")
+        # Observed (not merely executed) controls and fields travel with the
+        # navigation event so the App Map can ground the Test Designer in the
+        # page's real labels and input names.
+        observed_controls = [
+            " ".join(str(getattr(action, "text", "")).split())
+            for action in observation.actions[:20]
+        ]
+        observed_inputs = [
+            {
+                "type": str(item.get("type") or ""),
+                "name": str(item.get("name") or ""),
+                "placeholder": str(item.get("placeholder") or ""),
+            }
+            for item in observation.inputs[:12]
+            if isinstance(item, dict)
+        ]
         self.execution_history.append(
             {
                 "action_type": "navigation",
                 "success": True,
                 "page_title": observation.page.title,
                 "url": observation.page.url,
+                "controls": [control for control in observed_controls if control],
+                "inputs": observed_inputs,
                 "timestamp": self._timestamp(),
             }
         )
@@ -161,7 +208,10 @@ class Explorer:
         available_actions = [
             action
             for action in observation.actions
-            if not self.memory.has_executed_action(observation.page.url, action.id)
+            if not self.memory.has_executed_action(
+                observation.page.url,
+                self._action_memory_key(action),
+            )
         ]
         logger.info(
             "Selected %s unexplored actions on %s",
@@ -175,6 +225,18 @@ class Explorer:
         print("==========================")
         return {"available_actions": available_actions}
 
+    @staticmethod
+    def _action_memory_key(action) -> str:
+        """Keep exploration memory stable when a page reorders DOM controls.
+
+        ``ActionRegistry`` ids intentionally reset for every observation.
+        Persisting those transient ids made an action at a new DOM position look
+        unexplored, and could also hide a different action that inherited the
+        old id. A visible label plus action type is stable across observations.
+        """
+        label = " ".join(str(getattr(action, "text", "")).casefold().split())
+        return f"{getattr(action, 'type', 'unknown')}::{label}"
+
     def _action_route(self, state: ExplorationState) -> Literal["plan", "complete"]:
         if state["iterations"] >= self.config.max_steps:
             logger.info("Stopping after configured maximum of %s observations", self.config.max_steps)
@@ -185,6 +247,12 @@ class Explorer:
             print("\n[OK] Exploration complete.")
             return "complete"
         return "plan"
+
+    def _plan_route(self, state: ExplorationState) -> Literal["execute", "complete"]:
+        if state.get("plan", {}).get("steps"):
+            return "execute"
+        logger.info("Exploration complete; planner has no safe workflow action to execute")
+        return "complete"
 
     def _prepare_candidates(self, state: ExplorationState) -> dict[str, Any]:
         """Prepare planner candidates in one graph superstep.
@@ -223,7 +291,30 @@ class Explorer:
 
     @traced_node("Planner Candidate Selection")
     def _select_candidates(self, state: ExplorationState) -> dict[str, Any]:
-        candidates = state["ranked_actions"][:self.config.max_planner_actions]
+        ranked_actions = state["ranked_actions"]
+        candidates = ranked_actions[:self.config.max_planner_actions]
+
+        # Ranking happens before the planner activates workflow memory.  On a
+        # dense dashboard, this can put a requested module such as Candidates
+        # or Clients just below the normal candidate limit, even though it is
+        # the only valid next step. Keep explicit workflow targets in the
+        # candidate set; the planner will still enforce its normal hard gate.
+        self.planner._activate_workflow(self.config)
+        workflow = self.planner.workflow_memory
+        if workflow and not workflow.target_reached:
+            targets = [
+                action for action in ranked_actions
+                if self.planner._is_target_action(action)
+            ]
+            if targets:
+                candidate_ids = {action.id for action in candidates}
+                promoted = [action for action in targets if action.id not in candidate_ids]
+                if promoted:
+                    candidates = [*promoted, *candidates]
+                    logger.info(
+                        "Promoted explicit workflow target(s) beyond planner limit: %s",
+                        ", ".join(action.text for action in promoted),
+                    )
         logger.info("Planner Candidates")
         for position, action in enumerate(candidates, start=1):
             logger.info("%s. %s (%s)", position, action.text, action.priority)
@@ -255,6 +346,16 @@ class Explorer:
     @traced_node("Executor")
     def _execute(self, state: ExplorationState) -> dict[str, Any]:
         success = self.executor.execute(state["plan"])
+        if not success and self._should_retry_login(state["observation"]):
+            # Model-written fill targets sometimes miss unlabeled login fields.
+            # The deterministic login plan targets the real input attributes,
+            # so exploration is never stranded on a login page it can pass.
+            logger.info("Plan failed on a login form; retrying with the deterministic login plan")
+            fallback = self.planner._fallback_plan(
+                state["observation"], self.config.username, self.config.password
+            )
+            if fallback.get("steps"):
+                success = self.executor.execute(fallback)
         self.on_event({"type": "status", "status": "Plan execution succeeded" if success else "Plan execution failed",
                        "url": self.browser.current_url()})
         logger.info("Plan execution %s", "succeeded" if success else "failed")
@@ -268,13 +369,14 @@ class Explorer:
         page_url = state["source_url"]
         page = state["observation"].page
         action_targets = {
-            action.id: action.text for action in state["planner_candidates"]
+            action.id: action for action in state["planner_candidates"]
         }
         for step in state["plan"].get("steps", []):
             action_type = step.get("type")
             target = step.get("target")
             if action_type == "click":
-                target = action_targets.get(step.get("action_id"), target)
+                action = action_targets.get(step.get("action_id"))
+                target = action.text if action else target
 
             if action_type in {"click", "fill"}:
                 event: dict[str, Any] = {
@@ -294,9 +396,25 @@ class Explorer:
                 if action_id is None:
                     logger.warning("Skipping click result without an action_id: %s", step)
                     continue
-                self.memory.mark_action(page_url, action_id)
-                logger.info("Recorded click action %s on %s", action_id, page_url)
+                action = action_targets.get(action_id)
+                if action is None:
+                    logger.warning("Skipping click result for unknown action %s", action_id)
+                    continue
+                self.memory.mark_action(page_url, self._action_memory_key(action))
+                logger.info("Recorded click action %s on %s", action.text, page_url)
+        if state["execution_succeeded"]:
+            self.planner.record_execution(state["plan"], state["planner_candidates"])
         return {}
+
+    def _should_retry_login(self, observation) -> bool:
+        """A failed plan is worth one deterministic retry only on a login form."""
+        if not (self.config.username and self.config.password):
+            return False
+        return any(
+            str((item or {}).get("type") or "").casefold() == "password"
+            for item in getattr(observation, "inputs", [])
+            if isinstance(item, dict)
+        )
 
     @staticmethod
     def _timestamp() -> str:
@@ -320,7 +438,15 @@ class Explorer:
                 result["exploration_history"] = self.execution_history
                 return result
         except Exception as exc:
-            self.observability.record_exception(exc, input={"start_url": self.config.start_url})
+            self.observability.record_exception(
+                exc,
+                input={"start_url": self.config.start_url},
+                context={
+                    "current_url": self.browser.current_url() if self.browser.page else self.config.start_url,
+                    "workflow_name": self.config.current_goal,
+                    "screenshot_path": getattr(self.browser, "latest_screenshot_path", None),
+                },
+            )
             raise
         finally:
             self.observability.flush()

@@ -6,6 +6,18 @@ class Action:
     id: int
     text: str
     type: str
+    # Lightweight, serializable extraction context. Existing consumers can
+    # continue using ``id``, ``text``, and ``type`` unchanged.
+    role: str | None = None
+    parent_role: str | None = None
+    container_context: str | None = None
+    ancestor_tags: list[str] = field(default_factory=list)
+    aria_role: str | None = None
+    tag_name: str | None = None
+    # The currently active interaction surface.  These values deliberately
+    # describe user-visible UI state rather than a component library.
+    context: str = "page"
+    container: str | None = None
 
 
 @dataclass
@@ -31,7 +43,14 @@ class Observation:
     accessibility_tree: list[dict[str, Any]] = field(default_factory=list)
     page_summary: str = ""
     page_title: str = ""
+    # Optional, screenshot-derived UI context. Kept independent from the DOM
+    # and accessibility representations so planner consumers can use either.
+    vision_observation: Any | None = None
     available_actions: list[Action] | None = None
+    # NORMAL_PAGE, MODAL, DRAWER, or POPOVER.  This is supplied to planners so
+    # they do not reason as if obscured page content were actionable.
+    ui_context: str = "NORMAL_PAGE"
+    active_container: str | None = None
 
     def __post_init__(self) -> None:
         # Keep current consumers of ``page.title`` and ``actions`` working,

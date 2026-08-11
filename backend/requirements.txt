@@ -3,6 +3,10 @@ groq
 python-dotenv
 openai
 pydantic>=2.0.0
+google-genai
+Pillow
 langgraph
-langfuse>=3.0.0
+langgraph-checkpoint-sqlite
+langfuse>=4.7.0
 streamlit
+pypdf

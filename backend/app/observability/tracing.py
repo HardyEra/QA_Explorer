@@ -44,31 +44,35 @@ class ObservabilityBackend(Protocol):
                    input: Any = None, metadata: dict[str, Any] | None = None) -> AbstractContextManager[Observation]: ...
 
     def record_exception(self, exception: BaseException, *, input: Any = None,
-                         output: Any = None, retry_count: int = 0) -> None: ...
+                         output: Any = None, retry_count: int = 0,
+                         context: dict[str, Any] | None = None) -> None: ...
 
     def flush(self) -> None: ...
 
 
 class NoopObservation:
-    def update(self, **_: Any) -> None:
+    def update(self, *, output: Any = None, metadata: dict[str, Any] | None = None,
+               usage_details: dict[str, int] | None = None,
+               status_message: str | None = None) -> None:
         return None
 
 
 class NoopObservability:
     """Safe local/default backend when telemetry credentials are not configured."""
 
-    def trace(self, name: str, *, metadata: TraceMetadata, input: Any = None):
+    def trace(self, name: str, *, metadata: TraceMetadata, input: Any = None) -> AbstractContextManager[Observation]:
         return nullcontext(NoopObservation())
 
-    def span(self, name: str, *, input: Any = None, metadata: dict[str, Any] | None = None):
+    def span(self, name: str, *, input: Any = None, metadata: dict[str, Any] | None = None) -> AbstractContextManager[Observation]:
         return nullcontext(NoopObservation())
 
     def generation(self, name: str, *, model: str, temperature: float | None,
-                   input: Any = None, metadata: dict[str, Any] | None = None):
+                   input: Any = None, metadata: dict[str, Any] | None = None) -> AbstractContextManager[Observation]:
         return nullcontext(NoopObservation())
 
     def record_exception(self, exception: BaseException, *, input: Any = None,
-                         output: Any = None, retry_count: int = 0) -> None:
+                         output: Any = None, retry_count: int = 0,
+                         context: dict[str, Any] | None = None) -> None:
         return None
 
     def flush(self) -> None:
