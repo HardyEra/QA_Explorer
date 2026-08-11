@@ -29,15 +29,20 @@ class BrowserController:
         self.latest_screenshot_path = None
         self.workflow_name = None
 
-    def start(self, observability=None):
+    def start(self, observability=None, headless=False, storage_state=None):
         self.observability = observability or NoopObservability()
         self.playwright = sync_playwright().start()
 
         self.browser = self.playwright.chromium.launch(
-            headless=False
+            headless=headless
         )
 
-        self.page = self.browser.new_page()
+        if storage_state:
+            # A saved session's cookies are injected into an otherwise fresh
+            # context: the test starts already logged in, isolation intact.
+            self.page = self.browser.new_context(storage_state=storage_state).new_page()
+        else:
+            self.page = self.browser.new_page()
         # Catch popups as soon as the browser context creates them. Checking only
         # after a click misses delayed window.open() calls from social links.
         self.page.context.on("page", self._handle_new_page)
@@ -148,6 +153,10 @@ class BrowserController:
         with self._browser_action("screenshot", selector=str(path)):
             self.page.screenshot(path=path)
         self.latest_screenshot_path = str(path)
+
+    def save_session(self, path):
+        """Persist the current context's cookies/session for later reuse."""
+        self.page.context.storage_state(path=str(path))
 
     def close(self):
         if self.browser:
@@ -349,7 +358,22 @@ class BrowserController:
             lambda: self.page.locator(f'#{target}'),
             lambda: self.page.get_by_label(target),
             lambda: self.page.locator(f'[aria-label="{target}"]'),
+            # Case-insensitive attribute matches: planners and designers often
+            # capitalise a field name ("Email") that the DOM stores lowercase.
+            lambda: self.page.locator(f'[name="{target}" i]'),
+            lambda: self.page.locator(f'[id="{target}" i]'),
+            lambda: self.page.locator(f'[aria-label="{target}" i]'),
         ]
+        # Semantic fallbacks by intent: custom login forms frequently expose no
+        # label, name, or placeholder at all, but their input types are still
+        # unambiguous. "username"/"email"/"password" targets must reach them.
+        intent = str(target or "").casefold()
+        if "password" in intent:
+            strategies.append(lambda: self.page.locator('input[type="password"]'))
+        if any(term in intent for term in ("email", "e-mail", "username", "user name", "login id", "userid")):
+            strategies.append(lambda: self.page.locator('input[type="email"]'))
+            strategies.append(lambda: self.page.locator('input[autocomplete="username"]'))
+            strategies.append(lambda: self.page.locator('form input[type="text"]'))
 
         for strategy in strategies:
             try:

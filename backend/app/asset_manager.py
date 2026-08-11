@@ -52,6 +52,16 @@ class AssetManager:
         logger.info("Resolved test asset '%s' to %s", asset_type, asset_path)
         return asset_path
 
+    def list_assets(self) -> dict[str, Path]:
+        """All stored assets by type — what upload test steps may reference."""
+        if not self.upload_dir.is_dir():
+            return {}
+        assets: dict[str, Path] = {}
+        for path in sorted(self.upload_dir.iterdir()):
+            if path.is_file() and self._ASSET_TYPE_PATTERN.fullmatch(path.stem):
+                assets[path.stem] = path
+        return assets
+
     def save_resume(self, filename: str, content: bytes) -> Path:
         """Validate and persist the resume asset."""
         if Path(filename).suffix.lower() not in self.RESUME_EXTENSIONS:

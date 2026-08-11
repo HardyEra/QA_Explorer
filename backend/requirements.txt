@@ -6,5 +6,7 @@ pydantic>=2.0.0
 google-genai
 Pillow
 langgraph
+langgraph-checkpoint-sqlite
 langfuse>=4.7.0
 streamlit
+pypdf

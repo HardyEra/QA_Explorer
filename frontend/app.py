@@ -21,6 +21,15 @@ for path in (BACKEND_ROOT, BACKEND_APP):
         sys.path.insert(0, str(path))
 
 from asset_manager import AssetManager  # noqa: E402
+from pipeline_runner import (  # noqa: E402
+    add_custom_requirement,
+    add_custom_test_case,
+    load_custom_requirements,
+    load_custom_test_cases,
+    load_feedback,
+    run_pipeline,
+    save_feedback,
+)
 from runner import run_exploration  # noqa: E402
 
 
@@ -125,6 +134,14 @@ st.markdown(
       [data-testid="stMain"] .stTextArea textarea:focus,
       [data-testid="stMain"] .stNumberInput input:focus { box-shadow: 0 0 0 3px rgba(168, 85, 247, .14) !important; }
       .footer-note { color: #98a2b3; font-size: .78rem; text-align: center; padding: 1.2rem 0 .3rem; }
+      div[class*="st-key-add_req_btn"] button, div[class*="st-key-add_case_btn"] button,
+      div[class*="st-key-add_req_btn"] button p, div[class*="st-key-add_case_btn"] button p {
+        background: #111827 !important; color: #ffffff !important;
+        border-color: #111827 !important;
+      }
+      div[class*="st-key-add_req_btn"] button:hover, div[class*="st-key-add_case_btn"] button:hover {
+        background: #1f2937 !important; border-color: #1f2937 !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -151,6 +168,53 @@ def start_run(inputs: dict[str, object]) -> tuple[threading.Thread, queue.Queue]
     return thread, events
 
 
+def start_pipeline_run(inputs: dict[str, object]) -> tuple[threading.Thread, queue.Queue, dict]:
+    """Run the multi-agent pipeline off the UI thread; the holder carries its result."""
+    events: queue.Queue = queue.Queue()
+    holder: dict = {}
+
+    def worker() -> None:
+        try:
+            holder["state"] = run_pipeline(on_event=events.put, **inputs)
+        except Exception:
+            # The pipeline emits a user-safe failure event before raising.
+            pass
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread, events, holder
+
+
+def save_uploaded_docs(files) -> list[str]:
+    """Persist uploaded PRD/product documents where the backend can read them."""
+    docs_dir = BACKEND_ROOT / "uploads" / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for uploaded in files or []:
+        path = docs_dir / uploaded.name
+        path.write_bytes(uploaded.getvalue())
+        paths.append(str(path))
+    return paths
+
+
+PIPELINE_STATUS_MARKERS = (
+    ("Doc Analyst", "Analyzing product documents"),
+    ("App Map built", "Exploration complete — App Map ready"),
+    ("Fanning out", None),  # keep the concrete fan-out message itself
+    ("Test Designer produced", "Designing test cases"),
+    ("Coverage Critic verdict", "Reviewing test coverage"),
+    ("Healer decision", "Healing a failed test step"),
+    ("Report written", "Generating the QA report"),
+)
+
+
+def pipeline_status_from_log(message: str) -> str | None:
+    for marker, status in PIPELINE_STATUS_MARKERS:
+        if marker in message:
+            return status or message.split(": ", 1)[-1]
+    return None
+
+
 def save_uploaded_resume(asset_manager: AssetManager) -> None:
     uploaded_resume = st.session_state.get("resume_upload")
     if uploaded_resume is None:
@@ -169,7 +233,29 @@ def save_uploaded_resume(asset_manager: AssetManager) -> None:
         st.session_state.pop("resume_error", None)
 
 
-def render_run_console(worker: threading.Thread, events: queue.Queue, initial_url: str, mode: str) -> None:
+def save_uploaded_assets(asset_manager: AssetManager) -> None:
+    """Store arbitrary test assets that upload test steps can reference by name."""
+    import re
+
+    for uploaded in st.session_state.get("asset_uploads") or []:
+        content = uploaded.getvalue()
+        signature = (uploaded.name, sha256(content).hexdigest())
+        if signature in st.session_state.setdefault("stored_asset_signatures", set()):
+            continue
+        asset_type = re.sub(r"[^a-z0-9_]+", "_", Path(uploaded.name).stem.lower()).strip("_") or "asset"
+        if not asset_type[0].isalpha():
+            asset_type = f"a_{asset_type}"
+        try:
+            asset_manager.save_asset(asset_type, uploaded.name, content)
+        except ValueError as exc:
+            st.session_state["asset_error"] = str(exc)
+        else:
+            st.session_state["stored_asset_signatures"].add(signature)
+            st.session_state.pop("asset_error", None)
+
+
+def render_run_console(worker: threading.Thread, events: queue.Queue, initial_url: str, mode: str,
+                       run_label: str = "Exploration") -> None:
     status = "Preparing secure browser session"
     current_url = initial_url
     logs: list[str] = []
@@ -177,8 +263,8 @@ def render_run_console(worker: threading.Thread, events: queue.Queue, initial_ur
     event_count = 0
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown('<p class="panel-title">Live exploration</p>', unsafe_allow_html=True)
-    st.markdown('<p class="panel-subtitle">Keep this page open while the agent explores the application.</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="panel-title">Live {run_label.lower()}</p>', unsafe_allow_html=True)
+    st.markdown('<p class="panel-subtitle">Keep this page open while the agents work on the application.</p>', unsafe_allow_html=True)
     metric_a, metric_b, metric_c = st.columns(3)
     mode_metric = metric_a.empty()
     activity_metric = metric_b.empty()
@@ -205,6 +291,9 @@ def render_run_console(worker: threading.Thread, events: queue.Queue, initial_ur
             if event.get("type") == "log":
                 logs.append(event["message"])
                 logs = logs[-80:]
+                phase_status = pipeline_status_from_log(event["message"])
+                if phase_status:
+                    status = phase_status
             screenshot_path = event.get("screenshot_path")
             if screenshot_path and Path(screenshot_path).exists():
                 latest_screenshot = screenshot_path
@@ -214,7 +303,7 @@ def render_run_console(worker: threading.Thread, events: queue.Queue, initial_ur
         connection_metric.metric("Connection", "Running" if worker.is_alive() else "Finishing")
         status_box.markdown(f'<p class="status-label">Current activity</p><p class="status-value">{status}</p>', unsafe_allow_html=True)
         url_box.caption(f"Current page: {current_url}")
-        progress_box.progress(min(0.94, 0.08 + event_count * 0.025), text="Exploration is in progress")
+        progress_box.progress(min(0.94, 0.08 + event_count * 0.025), text=f"{run_label} is in progress")
         with visual_col:
             if latest_screenshot:
                 screenshot_box.image(latest_screenshot, caption="Latest browser state", use_container_width=True)
@@ -223,11 +312,127 @@ def render_run_console(worker: threading.Thread, events: queue.Queue, initial_ur
         with activity_col:
             log_box.code("\n".join(logs[-18:]) or "Waiting for activity…", language=None)
 
-    progress_box.progress(1.0, text="Exploration finished")
-    if status.startswith("Exploration failed"):
+    progress_box.progress(1.0, text=f"{run_label} finished")
+    if "failed" in status.casefold():
         st.error(status)
     else:
         st.success(status)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_pipeline_report(report: dict) -> None:
+    """Render the multi-agent run's QA report with downloadable artifacts."""
+    summary = report.get("summary", {})
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">QA report</p>', unsafe_allow_html=True)
+    health = report.get("model_health")
+    if health and health.get("failures"):
+        st.warning(
+            f"⚠️ The AI model was unavailable for {health['failures']} of "
+            f"{health['calls']} call(s) during this run (e.g. daily rate limit reached). "
+            "These results were produced by simple fallback logic, not AI test design — "
+            "rerun later for a real report."
+        )
+    st.markdown(f'<p class="panel-subtitle">Run {report.get("run_id", "")} · generated {report.get("generated_at", "")}</p>', unsafe_allow_html=True)
+
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Tests", summary.get("total_tests", 0))
+    metric_columns[1].metric("Passed", summary.get("passed", 0))
+    metric_columns[2].metric("Failed", summary.get("failed", 0) + summary.get("errors", 0))
+    metric_columns[3].metric("Pass rate", f'{summary.get("pass_rate", 0)}%')
+    metric_columns[4].metric(
+        "Requirements",
+        f'{summary.get("requirements_tested", 0)}/{summary.get("requirements_total", 0)}',
+    )
+    metric_columns[5].metric("Blocked", summary.get("requirements_blocked", 0),
+                             help="Requirements the supplied account's role cannot verify.")
+
+    results = report.get("results", [])
+    if results:
+        st.markdown("**Test results**")
+        st.dataframe(
+            [
+                {
+                    "Test": result.get("title", ""),
+                    "What it tests": result.get("description", ""),
+                    "Requirement": result.get("requirement_id") or "—",
+                    "Priority": result.get("priority", ""),
+                    "Status": result.get("status", ""),
+                    "Healed": "yes" if result.get("healed") else "",
+                    "Duration (ms)": result.get("duration_ms", 0),
+                }
+                for result in results
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("🧾 Test details — what each test does and why it passed or failed"):
+            for result in results:
+                icon = "✅" if result.get("status") == "passed" else "❌"
+                st.markdown(f"**{icon} {result.get('title', '')}** · `{result.get('test_id', '')}`")
+                if result.get("description"):
+                    st.markdown(f"*What it tests:* {result['description']}")
+                if result.get("explanation"):
+                    st.markdown(f"*Outcome:* {result['explanation']}")
+                st.divider()
+
+    coverage = report.get("coverage", [])
+    if coverage:
+        with st.expander("Requirement coverage", expanded=False):
+            st.dataframe(
+                [
+                    {
+                        "Requirement": item.get("title", ""),
+                        "Feature": item.get("feature", ""),
+                        "Priority": item.get("priority", ""),
+                        "Status": item.get("status", ""),
+                        "Tests": item.get("test_count", 0),
+                    }
+                    for item in coverage
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if report.get("blocked"):
+        with st.expander(f'🔒 Blocked requirements ({len(report["blocked"])}) — need a different role or account'):
+            for entry in report["blocked"]:
+                st.write(
+                    f'**{entry.get("title") or entry.get("requirement_id")}** '
+                    f'(`{entry.get("requirement_id")}`) — {entry.get("reason")}'
+                )
+
+    for bug in report.get("bugs", []):
+        with st.expander(f'❌ {bug.get("title", "Failure")} ({bug.get("test_id", "")})'):
+            if bug.get("description"):
+                st.write(f'**What it tests:** {bug["description"]}')
+            if bug.get("explanation"):
+                st.write(f'**Why it failed:** {bug["explanation"]}')
+            st.write(f'**Reason:** {bug.get("reason", "unknown")}')
+            if bug.get("failed_step"):
+                st.code(str(bug["failed_step"]), language=None)
+            screenshot = (bug.get("evidence") or {}).get("screenshot")
+            if screenshot and Path(screenshot).exists():
+                st.image(screenshot, caption="Final browser state", use_container_width=True)
+
+    artifacts = report.get("artifacts", {})
+    download_columns = st.columns(3)
+    for column, (label, key, mime) in zip(
+        download_columns,
+        (("Markdown report", "markdown", "text/markdown"),
+         ("JUnit XML", "junit", "application/xml"),
+         ("Raw JSON", "json", "application/json")),
+    ):
+        artifact_path = artifacts.get(key)
+        if artifact_path and Path(artifact_path).exists():
+            column.download_button(
+                f"Download {label}",
+                data=Path(artifact_path).read_bytes(),
+                file_name=Path(artifact_path).name,
+                mime=mime,
+                use_container_width=True,
+                key=f"download-{key}",
+            )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -253,7 +458,16 @@ st.markdown(
 form_col, guide_col = st.columns([1.55, 1], gap="large")
 with form_col:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown('<p class="panel-title">New exploration</p><p class="panel-subtitle">Start with a URL, then add only the context the agent needs.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">New run</p><p class="panel-subtitle">Start with a URL, then add only the context the agents need.</p>', unsafe_allow_html=True)
+    run_mode = st.radio(
+        "Run mode",
+        ["Full QA pipeline", "Exploration only"],
+        horizontal=True,
+        help="The full pipeline analyses your docs, explores the app, designs and executes "
+             "test cases in parallel, and produces a QA report. Exploration only runs the "
+             "original discovery agent.",
+    )
+    pipeline_mode = run_mode == "Full QA pipeline"
     with st.form("exploration_form", clear_on_submit=False):
         website_url = st.text_input("Target URL", placeholder="https://app.example.com", help="The application entry point to explore.")
         credentials_col, steps_col = st.columns([1.5, 1])
@@ -265,7 +479,36 @@ with form_col:
             max_steps = st.number_input("Exploration depth", min_value=1, max_value=500, value=30, step=5, help="Maximum actions the agent may take.")
         exploration_goal = st.text_area("What should the agent accomplish?", placeholder="Example: Open Candidates, find Nicole, update the candidate name to Max, save, then log out.", height=110)
         application_context = st.text_area("Application context (optional)", placeholder="Important roles, rules, modules, or areas to prioritise and avoid.", height=80)
-        submitted = st.form_submit_button("Start exploration", type="primary", use_container_width=True)
+        if pipeline_mode:
+            uploaded_docs = st.file_uploader(
+                "PRD and product documents (optional)",
+                type=["md", "txt", "pdf"],
+                accept_multiple_files=True,
+                help="Requirements are extracted from these documents and every test case "
+                     "traces back to one of them.",
+            )
+            pipeline_col_a, pipeline_col_b = st.columns(2)
+            with pipeline_col_a:
+                workers = st.number_input("Parallel workers", min_value=1, max_value=8, value=3,
+                                          help="Parallel budget for document analysis, test design, and test execution.")
+            with pipeline_col_b:
+                skip_exploration = st.checkbox(
+                    "Skip exploration (design from documents only)",
+                    value=False,
+                    help="Faster, but test cases lose grounding in the observed UI.",
+                )
+                preserve_session = st.checkbox(
+                    "Reuse login session across tests",
+                    value=False,
+                    help="Logs in once, saves the session, and skips the login steps in every "
+                         "test that uses the real credentials (~15–20s faster per test). "
+                         "Invalid-login tests still run fresh and logged out.",
+                )
+        submitted = st.form_submit_button(
+            "Start QA pipeline" if pipeline_mode else "Start exploration",
+            type="primary",
+            use_container_width=True,
+        )
     st.markdown("</div>", unsafe_allow_html=True)
 
 with guide_col:
@@ -275,20 +518,129 @@ with guide_col:
     st.markdown("</div>", unsafe_allow_html=True)
     st.write("")
     st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown('<p class="panel-title">Test asset</p><p class="panel-subtitle">Upload a resume for file-upload workflows.</p>', unsafe_allow_html=True)
-    st.file_uploader("Resume", type=["pdf", "doc", "docx"], key="resume_upload", label_visibility="collapsed", on_change=save_uploaded_resume, args=(asset_manager,))
-    if st.session_state.get("resume_error"):
-        st.error(st.session_state["resume_error"])
-    elif st.session_state.get("stored_resume_name"):
-        st.success(f"Ready: {st.session_state['stored_resume_name']}")
+    st.markdown('<p class="panel-title">Your requirements & test cases</p><p class="panel-subtitle">Add your own alongside what the agent derives — included in every run.</p>', unsafe_allow_html=True)
+    # Injected adjacent to the buttons: covers Streamlit builds without
+    # st-key-* wrapper classes by targeting the two adjacent columns directly.
+    st.markdown(
+        """
+        <style>
+          div[class*="st-key-add_req_btn"] button, div[class*="st-key-add_case_btn"] button {
+            background: #111827 !important; color: #ffffff !important;
+            border-color: #111827 !important;
+          }
+          div[class*="st-key-add_req_btn"] button *, div[class*="st-key-add_case_btn"] button * {
+            color: #ffffff !important;
+          }
+          [data-testid="stHorizontalBlock"]:has(div[class*="add_req_btn"]) button {
+            background: #111827 !important; color: #ffffff !important;
+            border-color: #111827 !important;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    add_req_col, add_case_col = st.columns(2)
+    if add_req_col.button("＋ Add requirement", key="add_req_btn", use_container_width=True):
+        st.session_state["show_add_req"] = not st.session_state.get("show_add_req", False)
+    if add_case_col.button("＋ Add test case", key="add_case_btn", use_container_width=True):
+        st.session_state["show_add_case"] = not st.session_state.get("show_add_case", False)
+
+    if st.session_state.get("show_add_req"):
+        with st.form("add_requirement_form", clear_on_submit=True):
+            req_title = st.text_input("Requirement", placeholder="Candidates can be created from a resume upload")
+            req_feature = st.text_input("Feature/module", placeholder="candidates")
+            req_description = st.text_area("Details (optional)", height=70)
+            req_priority = st.selectbox("Priority", ["critical", "high", "medium", "low"], index=1)
+            if st.form_submit_button("Save requirement", use_container_width=True):
+                if req_title.strip():
+                    saved = add_custom_requirement(req_feature, req_title, req_description, req_priority)
+                    st.success(f"Saved as {saved['id']} — tests will be designed for it on every run.")
+                else:
+                    st.error("The requirement needs a title.")
+
+    if st.session_state.get("show_add_case"):
+        with st.form("add_test_case_form", clear_on_submit=True):
+            case_title = st.text_input("Test case title", placeholder="Create a job from the Upload JD card")
+            case_description = st.text_area("What it tests (optional)", height=60)
+            case_steps = st.text_area(
+                "Steps — one per line",
+                placeholder="navigate: /login\nfill: email = {username}\nfill: password = {password}\nclick: Log In\nclick: Jobs\nupload: Choose Files = resume",
+                height=140,
+            )
+            case_expected = st.text_area(
+                "Checks — one per line",
+                placeholder="url: /jobs\ntext: Job created",
+                height=80,
+            )
+            if st.form_submit_button("Save test case", use_container_width=True):
+                result = add_custom_test_case(case_title, case_description, case_steps, case_expected)
+                if isinstance(result, str):
+                    st.error(result)
+                else:
+                    st.success(f"Saved as {result['id']} — it will execute in every run.")
+
+    custom_requirements = load_custom_requirements()
+    custom_cases = load_custom_test_cases()
+    if custom_requirements or custom_cases:
+        st.caption(f"Stored: {len(custom_requirements)} requirement(s), {len(custom_cases)} test case(s)")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.write("")
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Agent memory</p><p class="panel-subtitle">Corrections the agent applies to every future run — e.g. “the Offline status is called Unavailable in the UI”, “credentials are a Provider account”.</p>', unsafe_allow_html=True)
+    feedback_text = st.text_area(
+        "Remembered feedback",
+        value=load_feedback(),
+        height=110,
+        label_visibility="collapsed",
+        placeholder="One correction per line. The agents read these before every run.",
+    )
+    if st.button("Save memory", use_container_width=True):
+        save_feedback(feedback_text)
+        st.success("Saved — applied to every run from now on.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.write("")
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Test assets</p><p class="panel-subtitle">Files the agent may upload during tests (resumes, sample PDFs, images). Test steps reference them by name.</p>', unsafe_allow_html=True)
+    st.file_uploader("Assets", type=["pdf", "doc", "docx", "png", "jpg", "csv", "txt"],
+                     key="asset_uploads", accept_multiple_files=True,
+                     label_visibility="collapsed", on_change=save_uploaded_assets,
+                     args=(asset_manager,))
+    if st.session_state.get("asset_error"):
+        st.error(st.session_state["asset_error"])
+    stored_assets = asset_manager.list_assets()
+    if stored_assets:
+        st.caption("Stored: " + ", ".join(f"`{name}`" for name in stored_assets))
     else:
-        stored_resume = asset_manager.resolve_resume_path()
-        st.caption(f"Stored asset: {stored_resume.name}" if stored_resume else "No asset selected")
+        st.caption("No assets stored yet — upload flows will be skipped until you add one.")
     st.markdown("</div>", unsafe_allow_html=True)
 
 if submitted:
     if not is_valid_url(website_url):
         st.error("Enter a complete http:// or https:// URL to begin.")
+    elif pipeline_mode:
+        doc_paths = save_uploaded_docs(uploaded_docs)
+        pipeline_inputs = {
+            "start_url": website_url.strip(),
+            "docs": ",".join(doc_paths) if doc_paths else None,
+            "username": username,
+            "password": password,
+            "goal": exploration_goal,
+            "application_context": application_context,
+            "max_steps": int(max_steps),
+            "skip_exploration": bool(skip_exploration),
+            "preserve_session": bool(preserve_session),
+            "max_concurrency": int(workers),
+        }
+        st.write("")
+        worker, events, holder = start_pipeline_run(pipeline_inputs)
+        render_run_console(worker, events, website_url.strip(), "Goal Driven Exploration",
+                           run_label="QA pipeline")
+        report = (holder.get("state") or {}).get("report")
+        if report:
+            st.session_state["pipeline_report"] = report
+        else:
+            st.session_state.pop("pipeline_report", None)
+            st.warning("The pipeline did not produce a report. Check the activity log above for the failure.")
     else:
         run_inputs = {
             "start_url": website_url.strip(),
@@ -302,5 +654,9 @@ if submitted:
         st.write("")
         worker, events = start_run(run_inputs)
         render_run_console(worker, events, website_url.strip(), mode)
+
+if st.session_state.get("pipeline_report"):
+    st.write("")
+    render_pipeline_report(st.session_state["pipeline_report"])
 
 st.markdown('<p class="footer-note">Sentinel-QA · Local browser exploration</p>', unsafe_allow_html=True)

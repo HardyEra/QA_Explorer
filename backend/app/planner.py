@@ -9,7 +9,13 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 MODEL_TIMEOUT_MS = int(os.getenv("MODEL_TIMEOUT_MS", "10000"))
-PLANNER_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Exploration makes dozens of small planning calls per run; routing them to a
+# cheaper model with its own quota bucket keeps the main model's daily budget
+# for the test-design phase, which runs last and needs the strongest model.
+PLANNER_MODEL = (
+    os.getenv("GROQ_EXPLORER_MODEL")
+    or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+)
 PLANNER_TEMPERATURE = 0
 BUSINESS_WORKFLOW_CATEGORIES = {
     "authentication", "create", "submit", "save", "upload", "download",
@@ -75,13 +81,16 @@ class Planner:
 
     def __init__(self, observability):
         self.observability = observability
-        if not GROQ_API_KEY:
+        # A dedicated explorer key (e.g. a second Groq org) isolates the many
+        # small exploration calls from the design phase's token budget.
+        api_key = os.getenv("GROQ_EXPLORER_API_KEY") or GROQ_API_KEY
+        if not api_key:
             logger.warning("GROQ_API_KEY is not configured; using local fallback planning")
             self.client = None
             self.remote_planning_available = False
         else:
             self.client = Groq(
-                api_key=GROQ_API_KEY,
+                api_key=api_key,
                 timeout=MODEL_TIMEOUT_MS / 1000,
             )
             self.remote_planning_available = True
@@ -511,6 +520,10 @@ class Planner:
     def record_execution(self, plan, actions) -> None:
         """Advance workflow memory only after the executor reports success."""
         self._remember_workflow_action(plan, actions)
+        # Generic autonomous-discovery goals never activate workflow memory;
+        # there is nothing to advance for them.
+        if self.workflow_memory is None:
+            return
         by_id = {action.id: action for action in actions}
         for step in plan.get("steps", []):
             if step.get("type") != "click":
@@ -679,8 +692,9 @@ JSON Format:
                 self.observability.record_exception(
                     exc, input=prompt, retry_count=0, context=exception_context
                 )
-                logger.exception("Groq plan request failed; switching to local fallback planning")
-                self.remote_planning_available = False
+                # Fall back for THIS iteration only: a transient 429 must not
+                # downgrade the rest of a long exploration to rule-based plans.
+                logger.exception("Groq plan request failed; using local fallback for this step")
                 return self._fallback_plan(observation, getattr(config, "username", ""), getattr(config, "password", ""))
 
             content = (response.choices[0].message.content or "").strip()

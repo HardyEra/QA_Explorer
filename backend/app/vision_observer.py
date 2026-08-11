@@ -204,7 +204,13 @@ class VisionObserver:
         except Exception:
             sdk_version = "unknown"
         logger.info("Gemini SDK: google-genai %s", sdk_version)
-        return genai.Client(api_key=self.api_key), types
+        # Vision is supplementary perception: a stalled Gemini request must
+        # fail fast and let DOM-first exploration continue, never hang the run.
+        client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(timeout=30_000),
+        )
+        return client, types
 
     def _generate(
         self, client: Any, types: Any, image_bytes: bytes, prompt: str,

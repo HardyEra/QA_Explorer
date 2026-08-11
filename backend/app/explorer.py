@@ -124,14 +124,37 @@ class Explorer:
                 )
             except Exception as exc:
                 logger.warning("Vision observation unavailable; continuing without it: %s", exc)
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    # Quota will not recover mid-run; stop paying a failed
+                    # request's latency on every remaining observation.
+                    logger.warning("Vision disabled for the rest of this run (quota exhausted)")
+                    self.vision_observer.api_key = None
         else:
             logger.info("Vision observation skipped: GEMINI_API_KEY is not configured")
+        # Observed (not merely executed) controls and fields travel with the
+        # navigation event so the App Map can ground the Test Designer in the
+        # page's real labels and input names.
+        observed_controls = [
+            " ".join(str(getattr(action, "text", "")).split())
+            for action in observation.actions[:20]
+        ]
+        observed_inputs = [
+            {
+                "type": str(item.get("type") or ""),
+                "name": str(item.get("name") or ""),
+                "placeholder": str(item.get("placeholder") or ""),
+            }
+            for item in observation.inputs[:12]
+            if isinstance(item, dict)
+        ]
         self.execution_history.append(
             {
                 "action_type": "navigation",
                 "success": True,
                 "page_title": observation.page.title,
                 "url": observation.page.url,
+                "controls": [control for control in observed_controls if control],
+                "inputs": observed_inputs,
                 "timestamp": self._timestamp(),
             }
         )
@@ -323,6 +346,16 @@ class Explorer:
     @traced_node("Executor")
     def _execute(self, state: ExplorationState) -> dict[str, Any]:
         success = self.executor.execute(state["plan"])
+        if not success and self._should_retry_login(state["observation"]):
+            # Model-written fill targets sometimes miss unlabeled login fields.
+            # The deterministic login plan targets the real input attributes,
+            # so exploration is never stranded on a login page it can pass.
+            logger.info("Plan failed on a login form; retrying with the deterministic login plan")
+            fallback = self.planner._fallback_plan(
+                state["observation"], self.config.username, self.config.password
+            )
+            if fallback.get("steps"):
+                success = self.executor.execute(fallback)
         self.on_event({"type": "status", "status": "Plan execution succeeded" if success else "Plan execution failed",
                        "url": self.browser.current_url()})
         logger.info("Plan execution %s", "succeeded" if success else "failed")
@@ -372,6 +405,16 @@ class Explorer:
         if state["execution_succeeded"]:
             self.planner.record_execution(state["plan"], state["planner_candidates"])
         return {}
+
+    def _should_retry_login(self, observation) -> bool:
+        """A failed plan is worth one deterministic retry only on a login form."""
+        if not (self.config.username and self.config.password):
+            return False
+        return any(
+            str((item or {}).get("type") or "").casefold() == "password"
+            for item in getattr(observation, "inputs", [])
+            if isinstance(item, dict)
+        )
 
     @staticmethod
     def _timestamp() -> str:
