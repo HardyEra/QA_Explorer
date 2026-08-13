@@ -31,7 +31,7 @@ class AppMapBuilder:
             page = pages.setdefault(
                 url,
                 {"url": url, "title": str(event.get("page_title") or ""), "actions": [],
-                 "fills": [], "controls": [], "fields": []},
+                 "fills": [], "controls": [], "fields": [], "roles": {}},
             )
             if event.get("page_title") and not page["title"]:
                 page["title"] = str(event["page_title"])
@@ -43,6 +43,9 @@ class AppMapBuilder:
                     label = str(control).strip()
                     if label and label not in page["controls"] and len(page["controls"]) < MAX_ACTIONS_PER_PAGE:
                         page["controls"].append(label)
+                for label, role in (event.get("control_roles") or {}).items():
+                    if label and role:
+                        page.setdefault("roles", {})[str(label)] = str(role)
                 for item in event.get("inputs") or []:
                     if isinstance(item, dict):
                         field = {
@@ -84,13 +87,20 @@ class AppMapBuilder:
     @staticmethod
     def compact_text(app_map: dict[str, Any], max_pages: int = 15) -> str:
         """Serialize the map for a prompt without flooding the context."""
+        role_tags = {"combobox": "[dropdown]", "checkbox": "[checkbox]", "radio": "[radio]",
+                     "file_upload": "[file upload]", "menuitem": "[menu item]"}
         lines = [f"Start URL: {app_map.get('start_url', '')}"]
         for page in app_map.get("pages", [])[:max_pages]:
             lines.append(f"- Page: {page.get('title') or '(untitled)'} | {page.get('url')}")
+            roles = page.get("roles", {})
             labels = [action["label"] for action in page.get("actions", [])]
             for control in page.get("controls", []):
                 if control not in labels:
                     labels.append(control)
+            labels = [
+                f"{label} {role_tags[roles[label]]}" if roles.get(label) in role_tags else label
+                for label in labels
+            ]
             if labels:
                 lines.append(f"  Clickable: {', '.join(labels[:MAX_ACTIONS_PER_PAGE])}")
             fields = [fill["field"] for fill in page.get("fills", [])]

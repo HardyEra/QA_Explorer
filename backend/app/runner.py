@@ -8,6 +8,7 @@ planning and browser work.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -62,6 +63,8 @@ def run_exploration(
     exploration_goal: str = "",
     max_steps: int = 30,
     on_event: EventCallback | None = None,
+    guidance=None,
+    hitl_wait_seconds: int = 0,
 ) -> dict[str, Any]:
     """Run the existing explorer and report progress through ``on_event``."""
     callback = on_event or (lambda event: None)
@@ -80,7 +83,10 @@ def run_exploration(
         if event.get("type") == "observation":
             try:
                 SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-                browser.screenshot(str(SCREENSHOT_PATH))
+                # Write-then-rename is atomic: the UI never reads a half-written file.
+                tmp_path = SCREENSHOT_PATH.with_name("latest.tmp.png")
+                browser.screenshot(str(tmp_path))
+                os.replace(tmp_path, SCREENSHOT_PATH)
                 event = {**event, "screenshot_path": str(SCREENSHOT_PATH)}
             except Exception as exc:
                 logging.getLogger(__name__).debug("Could not capture screenshot: %s", exc)
@@ -98,8 +104,9 @@ def run_exploration(
             application_context=application_context.strip(),
             username=username,
             password=password,
+            hitl_wait_seconds=hitl_wait_seconds,
         )
-        explorer = Explorer(browser, config, observability, on_event=explorer_event)
+        explorer = Explorer(browser, config, observability, on_event=explorer_event, guidance=guidance)
         result = explorer.explore()
         generation_state: QAState = {
             "task": goal,

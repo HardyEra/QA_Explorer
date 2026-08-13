@@ -26,6 +26,7 @@ from agents.doc_analyst import DocAnalyst
 from agents.reporter import Reporter
 from agents.test_designer import TestDesigner
 from agents.test_executor import ExecutorAgent
+from agents.test_verifier import TestVerifier
 from observability.tracing import NoopObservability
 
 
@@ -48,6 +49,7 @@ class PipelineState(TypedDict, total=False):
     skip_exploration: bool
     preserve_session: bool
     session_state_path: str
+    hitl_wait_seconds: int
     doc_paths: list[str]
 
     # Fan-in channels: parallel branches append, LangGraph merges.
@@ -61,6 +63,7 @@ class PipelineState(TypedDict, total=False):
     design_rounds: int
     critique: dict[str, Any]
     test_plan: list[dict[str, Any]]
+    verification_problems: list[dict[str, Any]]
     report: dict[str, Any]
 
 
@@ -68,14 +71,16 @@ class QAOrchestrator:
     """Build and run the end-to-end multi-agent QA pipeline."""
 
     def __init__(self, observability=None, max_steps_default: int = 12, on_event=None,
-                 checkpointer=None):
+                 checkpointer=None, guidance=None):
         self.observability = observability or NoopObservability()
         self.on_event = on_event or (lambda event: None)
+        self.guidance = guidance
         self.doc_analyst = DocAnalyst(self.observability)
         self.cartographer = Cartographer(self.observability)
         self.designer = TestDesigner(self.observability)
         self.critic = CoverageCritic(self.observability)
         self.executor = ExecutorAgent(self.observability)
+        self.verifier = TestVerifier(self.observability)
         self.reporter = Reporter(self.observability)
         self.max_steps_default = max_steps_default
         self.graph = self._build(checkpointer)
@@ -205,7 +210,10 @@ class QAOrchestrator:
                     from runner import SCREENSHOT_PATH
 
                     SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    browser.screenshot(str(SCREENSHOT_PATH))
+                    import os as _os
+                    tmp_path = SCREENSHOT_PATH.with_name("latest.tmp.png")
+                    browser.screenshot(str(tmp_path))
+                    _os.replace(tmp_path, SCREENSHOT_PATH)
                     event = {**event, "screenshot_path": str(SCREENSHOT_PATH)}
                 except Exception:
                     logger.debug("Could not capture an exploration screenshot", exc_info=True)
@@ -223,8 +231,11 @@ class QAOrchestrator:
                 application_context=self._prd_seeded_context(state, store.load(state["start_url"])),
                 username=state.get("username", ""),
                 password=state.get("password", ""),
+                hitl_wait_seconds=state.get("hitl_wait_seconds", 0),
             )
-            result = Explorer(browser, config, self.observability, on_event=explorer_event).explore()
+            explorer = Explorer(browser, config, self.observability, on_event=explorer_event,
+                                guidance=self.guidance)
+            result = explorer.explore()
         finally:
             try:
                 browser.close()
@@ -235,9 +246,60 @@ class QAOrchestrator:
             state["start_url"], result.get("exploration_history", [])
         )
         logger.info("App Map built this run: %s page(s)", len(fresh_map["pages"]))
+        fresh_map = self._reconnoitre(state, fresh_map)
         # Knowledge compounds: this run's observations join every earlier run's.
         app_map = store.merge_and_save(state["start_url"], fresh_map)
-        return {"app_map": app_map}
+        updates: dict[str, Any] = {"app_map": app_map}
+        if explorer.live_guidance:
+            # Whatever the tester taught the explorer also informs test design.
+            updates["application_context"] = (
+                state.get("application_context", "").strip()
+                + "\nLive guidance the tester gave while watching exploration (authoritative):\n"
+                + "\n".join(f"- {message}" for message in explorer.live_guidance)
+            ).strip()
+        return updates
+
+    def _reconnoitre(self, state: PipelineState, fresh_map: dict[str, Any]) -> dict[str, Any]:
+        """Walk every mapped page once and record its real control inventory.
+
+        Exploration learns which pages exist; recon learns what is *on* them —
+        the ground truth the Test Verifier checks designed steps against.
+        """
+        from app_map_store import AppMapStore
+        from page_recon import PageRecon
+
+        stored = AppMapStore().load(state["start_url"]) or {}
+        urls: list[str] = []
+        for source in (fresh_map, stored):
+            for page in source.get("pages", []):
+                url = page.get("url")
+                if url and url not in urls:
+                    urls.append(url)
+        if not urls:
+            return fresh_map
+
+        inventory = PageRecon(self.observability).inventory(
+            state["start_url"], urls,
+            state.get("username", ""), state.get("password", ""),
+        )
+        if not inventory:
+            return fresh_map
+
+        pages = {page.get("url"): page for page in fresh_map.get("pages", [])}
+        for url, entry in inventory.items():
+            page = pages.setdefault(
+                url, {"url": url, "title": "", "actions": [], "fills": [],
+                      "controls": [], "fields": [], "roles": {}}
+            )
+            page["title"] = page.get("title") or entry.get("title", "")
+            for control in entry.get("controls", []):
+                if control not in page["controls"]:
+                    page["controls"].append(control)
+            for field in entry.get("fields", []):
+                if field not in page["fields"]:
+                    page["fields"].append(field)
+            page.setdefault("roles", {}).update(entry.get("roles", {}))
+        return {**fresh_map, "pages": list(pages.values())}
 
     # ------------------------------------------------------------------
     # Phase 1.5 — cartographer: connect the map to the requirements
@@ -419,11 +481,25 @@ class QAOrchestrator:
             })
             return {"test_plan": []}
 
+        # Verify every designed step against the observed control inventory:
+        # near-misses are corrected to real labels, unverifiable targets are
+        # flagged so the report can say so instead of blaming the application.
+        plan, verification_problems = self.verifier.verify(plan, state.get("app_map", {}))
+        if verification_problems:
+            self.on_event({
+                "type": "warning",
+                "status": f"{len(verification_problems)} designed step(s) reference controls "
+                          "that were never observed — flagged as unverified in the report.",
+            })
+
         # On single-session apps a fresh login invalidates the shared saved
         # session. Run session-reusing tests first, fresh-login tests last, so
         # auth tests cannot strand the rest of the plan on a login page.
         plan.sort(key=self._runs_fresh_login)
-        updates: dict[str, Any] = {"test_plan": plan[:MAX_TEST_CASES]}
+        updates: dict[str, Any] = {
+            "test_plan": plan[:MAX_TEST_CASES],
+            "verification_problems": verification_problems,
+        }
         if state.get("preserve_session") and state.get("username"):
             from pathlib import Path
 

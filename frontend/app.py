@@ -21,6 +21,7 @@ for path in (BACKEND_ROOT, BACKEND_APP):
         sys.path.insert(0, str(path))
 
 from asset_manager import AssetManager  # noqa: E402
+from guidance import GuidanceChannel  # noqa: E402
 from pipeline_runner import (  # noqa: E402
     add_custom_requirement,
     add_custom_test_case,
@@ -153,36 +154,35 @@ def is_valid_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def start_run(inputs: dict[str, object]) -> tuple[threading.Thread, queue.Queue]:
-    events: queue.Queue = queue.Queue()
+def start_active_run(kind: str, inputs: dict[str, object], run_label: str) -> None:
+    """Launch a run in a background thread; the page stays interactive.
 
-    def worker() -> None:
-        try:
-            run_exploration(on_event=events.put, **inputs)
-        except Exception:
-            # The runner emits a user-safe failure event before raising.
-            pass
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    return thread, events
-
-
-def start_pipeline_run(inputs: dict[str, object]) -> tuple[threading.Thread, queue.Queue, dict]:
-    """Run the multi-agent pipeline off the UI thread; the holder carries its result."""
+    Everything the console needs across Streamlit reruns lives in
+    ``st.session_state``, including the two-way guidance channel that powers
+    the live chat with the agent.
+    """
+    channel = GuidanceChannel()
     events: queue.Queue = queue.Queue()
     holder: dict = {}
 
     def worker() -> None:
         try:
-            holder["state"] = run_pipeline(on_event=events.put, **inputs)
+            if kind == "pipeline":
+                holder["state"] = run_pipeline(on_event=events.put, guidance=channel, **inputs)
+            else:
+                run_exploration(on_event=events.put, guidance=channel, **inputs)
         except Exception:
-            # The pipeline emits a user-safe failure event before raising.
+            # Both runners emit a user-safe failure event before raising.
             pass
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    return thread, events, holder
+    st.session_state.update(
+        run_active=True, run_kind=kind, run_label=run_label, run_worker=thread,
+        run_events=events, run_holder=holder, run_channel=channel,
+        run_logs=[], run_status="Starting…", run_url=str(inputs.get("start_url", "")),
+        run_shot=None, run_count=0,
+    )
 
 
 def save_uploaded_docs(files) -> list[str]:
@@ -254,70 +254,96 @@ def save_uploaded_assets(asset_manager: AssetManager) -> None:
             st.session_state.pop("asset_error", None)
 
 
-def render_run_console(worker: threading.Thread, events: queue.Queue, initial_url: str, mode: str,
-                       run_label: str = "Exploration") -> None:
-    status = "Preparing secure browser session"
-    current_url = initial_url
-    logs: list[str] = []
-    latest_screenshot: str | None = None
-    event_count = 0
+def render_active_run() -> None:
+    """Non-blocking live console: refreshes ~1×/s, chat stays interactive."""
+    worker: threading.Thread = st.session_state["run_worker"]
+    events: queue.Queue = st.session_state["run_events"]
+    channel: GuidanceChannel = st.session_state["run_channel"]
+    run_label = st.session_state["run_label"]
+
+    # Fold any new backend events into the accumulated console state.
+    while True:
+        try:
+            event = events.get_nowait()
+        except queue.Empty:
+            break
+        st.session_state["run_count"] += 1
+        if event.get("status"):
+            st.session_state["run_status"] = event["status"]
+        if event.get("url"):
+            st.session_state["run_url"] = event["url"]
+        if event.get("type") == "log":
+            logs = st.session_state["run_logs"]
+            logs.append(event["message"])
+            st.session_state["run_logs"] = logs[-80:]
+            phase_status = pipeline_status_from_log(event["message"])
+            if phase_status:
+                st.session_state["run_status"] = phase_status
+        screenshot_path = event.get("screenshot_path")
+        if screenshot_path and Path(screenshot_path).exists():
+            # Read and validate immediately; keep the previous good frame if
+            # the file is mid-write (PNG magic header check).
+            try:
+                data = Path(screenshot_path).read_bytes()
+                if data.startswith(b"\x89PNG") and len(data) > 1_000:
+                    st.session_state["run_shot"] = data
+            except OSError:
+                pass
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown(f'<p class="panel-title">Live {run_label.lower()}</p>', unsafe_allow_html=True)
-    st.markdown('<p class="panel-subtitle">Keep this page open while the agents work on the application.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="panel-subtitle">Watch the browser window; guide the agent below whenever it gets something wrong.</p>', unsafe_allow_html=True)
     metric_a, metric_b, metric_c = st.columns(3)
-    mode_metric = metric_a.empty()
-    activity_metric = metric_b.empty()
-    connection_metric = metric_c.empty()
-    status_box = st.empty()
-    url_box = st.empty()
-    progress_box = st.empty()
+    metric_a.metric("Run", run_label)
+    metric_b.metric("Activity", f'{st.session_state["run_count"]} events')
+    metric_c.metric("Connection", "Running" if worker.is_alive() else "Finishing")
+    st.markdown(
+        f'<p class="status-label">Current activity</p><p class="status-value">{st.session_state["run_status"]}</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f'Current page: {st.session_state["run_url"]}')
+    st.progress(min(0.94, 0.08 + st.session_state["run_count"] * 0.02), text=f"{run_label} is in progress")
     visual_col, activity_col = st.columns([1.25, 1])
     with visual_col:
-        screenshot_box = st.empty()
+        if st.session_state["run_shot"]:
+            try:
+                st.image(st.session_state["run_shot"], caption="Latest browser state",
+                         use_container_width=True)
+            except Exception:
+                st.info("Browser preview refreshing…")
+        else:
+            st.info("A browser preview will appear after the first page observation.")
     with activity_col:
-        log_box = st.empty()
-
-    while worker.is_alive() or not events.empty():
-        try:
-            event = events.get(timeout=0.25)
-        except queue.Empty:
-            event = None
-
-        if event:
-            event_count += 1
-            status = event.get("status", status)
-            current_url = event.get("url", current_url)
-            if event.get("type") == "log":
-                logs.append(event["message"])
-                logs = logs[-80:]
-                phase_status = pipeline_status_from_log(event["message"])
-                if phase_status:
-                    status = phase_status
-            screenshot_path = event.get("screenshot_path")
-            if screenshot_path and Path(screenshot_path).exists():
-                latest_screenshot = screenshot_path
-
-        mode_metric.metric("Mode", "Goal driven" if mode.startswith("Goal") else "Discovery")
-        activity_metric.metric("Activity", f"{event_count} events")
-        connection_metric.metric("Connection", "Running" if worker.is_alive() else "Finishing")
-        status_box.markdown(f'<p class="status-label">Current activity</p><p class="status-value">{status}</p>', unsafe_allow_html=True)
-        url_box.caption(f"Current page: {current_url}")
-        progress_box.progress(min(0.94, 0.08 + event_count * 0.025), text=f"{run_label} is in progress")
-        with visual_col:
-            if latest_screenshot:
-                screenshot_box.image(latest_screenshot, caption="Latest browser state", use_container_width=True)
-            else:
-                screenshot_box.info("A browser preview will appear after the first page observation.")
-        with activity_col:
-            log_box.code("\n".join(logs[-18:]) or "Waiting for activity…", language=None)
-
-    progress_box.progress(1.0, text=f"{run_label} finished")
-    if "failed" in status.casefold():
-        st.error(status)
-    else:
-        st.success(status)
+        st.code("\n".join(st.session_state["run_logs"][-18:]) or "Waiting for activity…", language=None)
     st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Guide the agent</p><p class="panel-subtitle">Your messages are injected into the agent’s next planning step, and it may ask you questions when stuck.</p>', unsafe_allow_html=True)
+    for who, text in list(channel.transcript):
+        with st.chat_message("assistant" if who == "agent" else "user"):
+            st.write(text)
+    if channel.pending_question:
+        st.warning("🤖 The agent is waiting for your answer — reply below.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    message = st.chat_input("e.g. “Client Name is a dropdown — click it and pick an option, don’t type”")
+    if message:
+        channel.send(message)
+        st.rerun()
+
+    if worker.is_alive() or not events.empty():
+        time.sleep(1.0)
+        st.rerun()
+
+    # Run finished: hand off to the normal page (report renders there).
+    st.session_state["run_active"] = False
+    if st.session_state["run_kind"] == "pipeline":
+        report = (st.session_state["run_holder"].get("state") or {}).get("report")
+        if report:
+            st.session_state["pipeline_report"] = report
+        else:
+            st.session_state.pop("pipeline_report", None)
+            st.session_state["run_failed_no_report"] = True
+    st.rerun()
 
 
 def render_pipeline_report(report: dict) -> None:
@@ -455,6 +481,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if st.session_state.get("run_active"):
+    render_active_run()
+    st.stop()
+
+if st.session_state.pop("run_failed_no_report", False):
+    st.warning("The pipeline did not produce a report. Check the activity log of the last run for the failure.")
+
 form_col, guide_col = st.columns([1.55, 1], gap="large")
 with form_col:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -503,6 +536,12 @@ with form_col:
                     help="Logs in once, saves the session, and skips the login steps in every "
                          "test that uses the real credentials (~15–20s faster per test). "
                          "Invalid-login tests still run fresh and logged out.",
+                )
+                ask_when_stuck = st.checkbox(
+                    "Agent may ask me when stuck (waits 120s)",
+                    value=True,
+                    help="During exploration, if the agent finds no safe next action it asks "
+                         "you in the chat and waits up to 120 seconds for your reply.",
                 )
         submitted = st.form_submit_button(
             "Start QA pipeline" if pipeline_mode else "Start exploration",
@@ -630,17 +669,10 @@ if submitted:
             "skip_exploration": bool(skip_exploration),
             "preserve_session": bool(preserve_session),
             "max_concurrency": int(workers),
+            "hitl_wait_seconds": 120 if ask_when_stuck else 0,
         }
-        st.write("")
-        worker, events, holder = start_pipeline_run(pipeline_inputs)
-        render_run_console(worker, events, website_url.strip(), "Goal Driven Exploration",
-                           run_label="QA pipeline")
-        report = (holder.get("state") or {}).get("report")
-        if report:
-            st.session_state["pipeline_report"] = report
-        else:
-            st.session_state.pop("pipeline_report", None)
-            st.warning("The pipeline did not produce a report. Check the activity log above for the failure.")
+        start_active_run("pipeline", pipeline_inputs, "QA pipeline")
+        st.rerun()
     else:
         run_inputs = {
             "start_url": website_url.strip(),
@@ -649,11 +681,10 @@ if submitted:
             "application_context": application_context,
             "exploration_goal": exploration_goal,
             "max_steps": int(max_steps),
+            "hitl_wait_seconds": 120,
         }
-        mode = "Goal Driven Exploration" if exploration_goal.strip() else "Autonomous Discovery"
-        st.write("")
-        worker, events = start_run(run_inputs)
-        render_run_console(worker, events, website_url.strip(), mode)
+        start_active_run("exploration", run_inputs, "Exploration")
+        st.rerun()
 
 if st.session_state.get("pipeline_report"):
     st.write("")

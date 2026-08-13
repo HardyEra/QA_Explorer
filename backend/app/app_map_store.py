@@ -94,12 +94,14 @@ class AppMapStore:
                         "fills": list(page.get("fills", [])),
                         "controls": list(page.get("controls", [])),
                         "fields": list(page.get("fields", [])),
+                        "roles": dict(page.get("roles", {})),
                     }
                     continue
                 if page.get("title") and not existing.get("title"):
                     existing["title"] = page["title"]
                 for key in ("actions", "fills", "controls", "fields"):
                     merge_list(existing.setdefault(key, []), page.get(key, []))
+                existing.setdefault("roles", {}).update(page.get("roles", {}))
 
         transitions: list[dict] = []
         for source in (old.get("transitions", []), new.get("transitions", [])):

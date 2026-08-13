@@ -184,6 +184,13 @@ class Planner:
         immediate decision when at least one workflow-advancing action exists.
         """
         actions = list(actions)
+        # Live tester guidance overrides workflow gating: when a human watching
+        # the run says what to do, every visible action is a legal choice.
+        if getattr(self, "_live_guidance_active", False):
+            return [
+                action for action in actions
+                if not self._is_automatic_logout(action)
+            ]
         if self.workflow_memory:
             prohibited_actions = [
                 action for action in actions
@@ -562,6 +569,13 @@ class Planner:
             "workflow_name": getattr(config, "current_goal", None),
             "active_action": "Plan",
         }
+        live_guidance = list(getattr(config, "live_guidance", []) or [])
+        self._live_guidance_active = bool(live_guidance)
+        guidance_text = (
+            "\n".join(f"- {message}" for message in live_guidance)
+            if live_guidance
+            else "None."
+        )
         decision_actions = self._decision_candidates(observation.actions)
         vision_context = self._vision_context(observation)
         actions = json.dumps(
@@ -623,6 +637,10 @@ Already Executed Actions:
 
 Application context supplied by the user:
 {getattr(config, "application_context", "") or "None"}
+
+LIVE GUIDANCE from the human tester watching this run right now (AUTHORITATIVE —
+follow it even when it contradicts the ranking, categories, or other rules):
+{guidance_text}
 
 Exploration objective:
 {getattr(config, "current_goal", "Autonomously discover application pages and actions")}

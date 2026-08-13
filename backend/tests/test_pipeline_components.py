@@ -94,6 +94,50 @@ def test_designer_fallback_yields_one_smoke_case_per_requirement(offline):
     assert all("This test will open" in case["description"] for case in cases)
 
 
+def test_fallback_smokes_assert_observed_controls_not_bare_urls(offline):
+    """Functionality over URLs: a smoke test must prove the screen rendered."""
+    designer = TestDesigner(model_client=offline)
+    app_map = {"pages": [{
+        "url": "https://vms.test/candidates", "title": "Candidates",
+        "actions": [], "fills": [], "fields": [], "roles": {},
+        "controls": ["Add Candidate", "Filters", "View details"],
+    }]}
+    requirements = [{"id": "app-R1", "feature": "candidates", "title": "Candidates screen opens",
+                     "source_url": "https://vms.test/candidates"}]
+
+    cases, _ = designer.design("candidates", requirements, app_map, "https://vms.test")
+
+    expected = cases[0]["expected"]
+    assert all(item["type"] == "element_visible" for item in expected)
+    assert [item["value"] for item in expected] == ["Add Candidate", "Filters", "View details"]
+
+
+def test_grounding_drops_meaningless_bare_domain_checks():
+    class Canned:
+        available = True
+
+        def complete_json(self, name, prompt):
+            return {"test_cases": [{
+                "id": "c1", "requirement_id": "r1", "title": "Open candidates",
+                "steps": [{"type": "click", "target": "Candidates"}],
+                "expected": [
+                    {"type": "element_visible", "value": "Add Candidate"},
+                    {"type": "url_contains", "value": "vms.test"},      # meaningless
+                    {"type": "url_contains", "value": "candidates"},    # specific, observed
+                ],
+            }], "blocked": []}
+
+    app_map = {"pages": [{"url": "https://vms.test/candidates", "title": "Candidates",
+                          "actions": [], "fills": [], "fields": [], "roles": {},
+                          "controls": ["Candidates", "Add Candidate"]}]}
+    cases, _ = TestDesigner(model_client=Canned()).design(
+        "candidates", [{"id": "r1", "title": "Candidates"}], app_map, "https://vms.test")
+
+    values = [item["value"] for item in cases[0]["expected"]]
+    assert "Add Candidate" in values and "candidates" in values
+    assert "vms.test" not in values
+
+
 def test_designer_grounds_expectations_and_keeps_valid_blocked_entries():
     class CannedModelClient:
         available = True
@@ -207,6 +251,77 @@ def test_session_reuse_skips_only_real_credential_logins():
         USERNAME_PLACEHOLDER in str(step.get("value", "")) for step in invalid_username
     )
     assert boundary is not None and not uses_real_credentials
+
+
+def test_verifier_corrects_near_misses_and_flags_inventions():
+    from agents.test_verifier import TestVerifier
+
+    app_map = {"pages": [{
+        "url": "https://vms.test/login", "title": "Login", "actions": [], "fills": [],
+        "controls": ["Sign in", "toggle password", "Onboarded Vendors 35"],
+        "fields": [{"type": "email", "name": "email", "placeholder": "Enter your email"}],
+        "roles": {},
+    }]}
+    cases = [{
+        "id": "auth", "title": "Login", "steps": [
+            {"type": "navigate", "target": "https://vms.test/login"},
+            {"type": "fill", "target": "email", "value": "{username}"},
+            {"type": "click", "target": "Sign In"},                     # case-only diff → exact
+            {"type": "click", "target": "View Onboarded Vendors details"},  # substring → corrected
+            {"type": "click", "target": "Teleport to Mars"},            # invented → flagged
+        ],
+        "expected": [
+            {"type": "url_contains", "value": "dashboard"},
+            {"type": "element_visible", "value": "Nonexistent Widget"},  # invented → dropped
+        ],
+    }]
+
+    verified, problems = TestVerifier().verify(cases, app_map)
+    steps = verified[0]["steps"]
+    assert steps[2]["target"] == "Sign in"
+    assert steps[3]["target"] == "Onboarded Vendors 35"
+    assert steps[4]["target"] == "Teleport to Mars"          # kept, but flagged
+    assert [e["value"] for e in verified[0]["expected"]] == ["dashboard"]
+    assert verified[0]["unverified"]
+    assert {p["target"] for p in problems} == {"Teleport to Mars", "Nonexistent Widget"}
+
+    # A report must call this a test-design problem, not a product defect.
+    from agents.reporter import Reporter
+
+    explanation = Reporter._explain_result({
+        "status": "failed", "unverified": verified[0]["unverified"],
+        "failed_step": {"index": 5, "type": "click", "target": "Teleport to Mars"},
+    })
+    assert "test-design problem" in explanation
+
+
+def test_guidance_channel_send_drain_ask():
+    import threading
+    import time as _time
+
+    from guidance import GuidanceChannel
+
+    channel = GuidanceChannel()
+    # Proactive guidance: tester sends, agent drains before planning.
+    channel.send("Client Name is a dropdown — select, don't type")
+    channel.send("")  # blank messages are ignored
+    assert channel.drain() == ["Client Name is a dropdown — select, don't type"]
+    assert channel.drain() == []
+    assert channel.transcript == [("tester", "Client Name is a dropdown — select, don't type")]
+
+    # Ask-and-wait: a late reply satisfies the blocked ask.
+    def reply_soon():
+        _time.sleep(0.2)
+        channel.send("Click the Purchase Order tab first")
+
+    threading.Thread(target=reply_soon, daemon=True).start()
+    answer = channel.ask("I'm stuck — what should I do?", timeout_s=3)
+    assert answer == "Click the Purchase Order tab first"
+    assert channel.pending_question is None
+    assert channel.transcript[1] == ("agent", "I'm stuck — what should I do?")
+
+    # Timeout: no reply → None, agent continues autonomously.
+    assert channel.ask("still stuck?", timeout_s=1) is None
 
 
 def test_total_ai_blackout_skips_test_execution():
@@ -338,6 +453,57 @@ def test_upload_step_is_valid_and_described(tmp_path):
     manager.save_asset("resume", "cv.pdf", b"pdf-bytes")
     manager.save_asset("invoice", "inv.pdf", b"pdf-bytes")
     assert sorted(manager.list_assets()) == ["invoice", "resume"]
+
+
+def test_select_step_and_control_roles_flow_to_designer_context():
+    from agents.test_designer.models import describe_step
+
+    # A dropdown control must produce a valid select step…
+    case = normalise_case(
+        {
+            "title": "Create PO with client",
+            "steps": [
+                {"type": "select", "target": "Client Name [dropdown]", "value": "Acme Corp"},
+                {"type": "select", "target": "Empty option", "value": ""},
+                {"type": "click", "target": "Create PO"},
+            ],
+            "expected": [{"type": "url_contains", "value": "purchase-order"}],
+        },
+        "sel-1",
+    )
+    assert case["steps"][0] == {"type": "select", "target": "Client Name", "value": "Acme Corp"}
+    # …the empty-option select is dropped, the click survives.
+    assert [s["type"] for s in case["steps"]] == ["select", "click"]
+    assert describe_step(case["steps"][0]) == "choose 'Acme Corp' in the 'Client Name' dropdown"
+
+    # Roles captured in the map are rendered as [dropdown] tags for the Designer.
+    history = [{
+        "action_type": "navigation", "success": True, "page_title": "PO",
+        "url": "https://vms.test/po/create",
+        "controls": ["Client Name", "Create PO"],
+        "control_roles": {"Client Name": "combobox"},
+    }]
+    app_map = AppMapBuilder().build("https://vms.test", history)
+    assert app_map["pages"][0]["roles"] == {"Client Name": "combobox"}
+    text = AppMapBuilder.compact_text(app_map)
+    assert "Client Name [dropdown]" in text and "Create PO" in text
+
+
+def test_app_map_store_merges_roles(tmp_path):
+    from app_map_store import AppMapStore
+
+    store = AppMapStore(root=tmp_path)
+    first = {"start_url": "https://vms.test", "pages": [
+        {"url": "https://vms.test/po", "title": "PO", "actions": [], "fills": [],
+         "controls": ["Client Name"], "fields": [], "roles": {"Client Name": "combobox"}}],
+        "transitions": []}
+    second = {"start_url": "https://vms.test", "pages": [
+        {"url": "https://vms.test/po", "title": "PO", "actions": [], "fills": [],
+         "controls": ["Status"], "fields": [], "roles": {"Status": "radio"}}],
+        "transitions": []}
+    store.merge_and_save("https://vms.test", first)
+    merged = store.merge_and_save("https://vms.test", second)
+    assert merged["pages"][0]["roles"] == {"Client Name": "combobox", "Status": "radio"}
 
 
 def test_cartographer_synthesizes_requirements_without_docs(offline):

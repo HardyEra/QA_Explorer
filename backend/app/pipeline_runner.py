@@ -238,6 +238,8 @@ def run_pipeline(
     preserve_session: bool = False,
     max_concurrency: int = 3,
     resume_run_id: str | None = None,
+    hitl_wait_seconds: int = 0,
+    guidance=None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run ingest → explore → map → design → critique → execute → report."""
@@ -273,6 +275,7 @@ def run_pipeline(
         "max_steps": max_steps,
         "skip_exploration": skip_exploration,
         "preserve_session": preserve_session,
+        "hitl_wait_seconds": hitl_wait_seconds,
         "doc_paths": doc_paths,
         # Tester-written requirements and cases join every run alongside the
         # document/exploration-derived ones.
@@ -287,7 +290,8 @@ def run_pipeline(
 
     llm_client.reset_model_health()
     orchestrator = QAOrchestrator(
-        observability, on_event=callback, checkpointer=_create_checkpointer()
+        observability, on_event=callback, checkpointer=_create_checkpointer(),
+        guidance=guidance,
     )
     try:
         final_state = orchestrator.invoke(

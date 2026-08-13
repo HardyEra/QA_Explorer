@@ -12,7 +12,7 @@ import re
 from typing import Any
 
 
-STEP_TYPES = {"navigate", "click", "fill", "upload"}
+STEP_TYPES = {"navigate", "click", "fill", "upload", "select"}
 EXPECTATION_TYPES = {"url_contains", "text_visible", "element_visible"}
 VALID_PRIORITIES = ("critical", "high", "medium", "low")
 
@@ -41,11 +41,18 @@ def normalise_case(raw: Any, fallback_id: str) -> dict[str, Any] | None:
         # Models sometimes copy the app map's annotated descriptor verbatim —
         # "Global Search... (type=text)" — but the annotation is not UI text.
         target = re.sub(r"\s*\(type=[a-z]+\)$", "", target)
-        if step_type in {"click", "fill"} and not target:
+        target = re.sub(r"\s*\[(dropdown|checkbox|radio|file upload|menu item)\]$", "", target)
+        if step_type in {"click", "fill", "select"} and not target:
             continue
         normalised = {"type": step_type, "target": target}
         if step_type == "fill":
             normalised["value"] = str(step.get("value") or "")
+        if step_type == "select":
+            # ``value`` is the visible text of the option to choose.
+            option = str(step.get("value") or step.get("option") or "").strip()
+            if not option:
+                continue
+            normalised["value"] = option
         if step_type == "upload":
             # ``value`` names the test asset from the library (e.g. "resume").
             normalised["value"] = str(step.get("value") or step.get("asset") or "").strip()
@@ -101,6 +108,8 @@ def describe_step(step: dict[str, Any]) -> str:
         asset = str(step.get("value") or "a test file")
         suffix = f" via '{target}'" if target else ""
         return f"upload the stored test asset '{asset}'{suffix}"
+    if step_type == "select":
+        return f"choose '{step.get('value', '')}' in the '{target}' dropdown"
     return str(step_type or "perform a step")
 
 

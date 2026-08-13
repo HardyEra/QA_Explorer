@@ -128,6 +128,7 @@ class ExecutorAgent:
             "requirement_id": test_case.get("requirement_id", ""),
             "title": test_case.get("title", ""),
             "description": test_case.get("description", ""),
+            "unverified": test_case.get("unverified", []),
             "priority": test_case.get("priority", "medium"),
             "status": "error",
             "failed_step": None,
@@ -250,11 +251,48 @@ class ExecutorAgent:
                 return f"no fillable input matched {target!r}"
             if step_type == "click":
                 return self._click_by_label(browser, target)
+            if step_type == "select":
+                return self._select_option(browser, target, step.get("value", ""))
             if step_type == "upload":
                 return self._upload_asset(browser, target, step.get("value", ""))
             return f"unsupported step type {step_type!r}"
         except Exception as exc:
             return f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _select_option(browser, target: str, option: str) -> str | None:
+        """Choose an option in a native <select> or a custom dropdown."""
+        page = browser.page
+        # Native selects first: select_option works without opening the menu.
+        for locate in (
+            lambda: page.get_by_label(target),
+            lambda: page.locator(f'select[name="{target}" i]'),
+            lambda: page.locator(f'select[aria-label="{target}" i]'),
+        ):
+            try:
+                locate().first.select_option(label=option, timeout=1_500)
+                browser.wait_for_page_ready()
+                return None
+            except Exception:
+                continue
+        # Custom dropdowns (React selects, comboboxes): open, then click the option.
+        open_error = ExecutorAgent._click_by_label(browser, target)
+        if open_error is not None:
+            return f"could not open the {target!r} dropdown: {open_error}"
+        for locate in (
+            lambda: page.get_by_role("option", name=option),
+            lambda: page.get_by_text(option, exact=True),
+            lambda: page.get_by_text(option),
+        ):
+            try:
+                locator = locate().first
+                locator.wait_for(state="visible", timeout=2_000)
+                locator.click(timeout=STEP_TIMEOUT_MS)
+                browser.wait_for_page_ready()
+                return None
+            except Exception:
+                continue
+        return f"opened {target!r} but no option matched {option!r}"
 
     @staticmethod
     def _upload_asset(browser, target: str, asset_name: str) -> str | None:
@@ -302,6 +340,13 @@ class ExecutorAgent:
             lambda: page.get_by_role("link", name=label),
             lambda: page.get_by_text(label, exact=True),
             lambda: page.get_by_text(label),
+            # Accessible names: icon controls often carry their label only in
+            # aria-label (e.g. "View Onboarded Vendors details"), which
+            # visible-text matching can never find.
+            lambda: page.get_by_label(label, exact=True),
+            lambda: page.get_by_label(label),
+            lambda: page.locator(f'[aria-label="{label}" i]'),
+            lambda: page.locator(f'[title="{label}" i]'),
         )
         last_error = None
         for strategy in strategies:
@@ -389,7 +434,10 @@ class ExecutorAgent:
             if expectation["type"] == "element_visible":
                 if browser.page.get_by_text(value).first.is_visible(timeout=1_000):
                     return True
-                return browser.page.get_by_placeholder(value).first.is_visible(timeout=500)
+                if browser.page.get_by_placeholder(value).first.is_visible(timeout=500):
+                    return True
+                # aria-labelled controls have no visible text to match.
+                return browser.page.get_by_label(value).first.is_visible(timeout=500)
         except Exception:
             return False
         return False

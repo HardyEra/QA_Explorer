@@ -64,7 +64,14 @@ class Reporter:
             held = "; ".join(describe_expectation(check) for check in checks)
             return f"Every step executed successfully, and every check held: {held}."
 
+        unverified = result.get("unverified") or []
         failed_step = result.get("failed_step")
+        if status != "passed" and unverified:
+            return (
+                "This test could not be trusted: it referenced controls that were never "
+                f"observed in the application ({'; '.join(unverified)}). Treat it as a test-design "
+                "problem, not a product defect."
+            )
         if status == "failed" and failed_step:
             reason = str(result.get("failure_reason") or "").strip()
             explanation = (

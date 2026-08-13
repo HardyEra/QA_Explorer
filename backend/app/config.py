@@ -20,7 +20,8 @@ class ExplorationConfig:
                  current_goal="Autonomously discover application pages and actions",
                  application_context="",
                  username="",
-                 password=""):
+                 password="",
+                 hitl_wait_seconds=0):
 
         self.start_url = start_url
         self.follow_external = follow_external
@@ -34,6 +35,8 @@ class ExplorationConfig:
         self.application_context = application_context
         self.username = username
         self.password = password
+        # >0 enables "ask the tester when stuck" during exploration.
+        self.hitl_wait_seconds = hitl_wait_seconds
 
         self.base_domain = urlparse(start_url).netloc
 
