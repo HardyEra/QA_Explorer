@@ -642,3 +642,49 @@ def test_orchestrator_graph_compiles_and_routes():
     assert orchestrator._critic_route(
         {"critique": {"approved": True, "gaps": []}, "design_rounds": 1}
     ) == "collect_tests"
+
+
+def test_decision_evaluation_separates_agent_quality_from_product_failures():
+    from decision_evaluation import evaluate_run
+
+    evaluation = evaluate_run({
+        "run_id": "eval-1",
+        "start_url": "https://example.test",
+        "requirements": [
+            {"id": "r1", "title": "Login"},
+            {"id": "r2", "title": "Checkout"},
+        ],
+        "test_plan": [
+            {"id": "t1", "requirement_id": "r1"},
+            {"id": "t2", "requirement_id": "r2"},
+        ],
+        # A product test failure is still a runnable, grounded agent decision.
+        "results": [
+            {"test_id": "t1", "status": "passed"},
+            {"test_id": "t2", "status": "failed"},
+        ],
+        "verification_problems": [],
+    })
+
+    assert evaluation["scores"]["requirements_coverage"] == 1.0
+    assert evaluation["scores"]["plan_grounding"] == 1.0
+    assert evaluation["scores"]["plan_runnability"] == 1.0
+    assert evaluation["scores"]["execution_success_rate"] == 0.5
+    assert evaluation["scores"]["agent_decision_quality"] == 1.0
+    assert evaluation["outcome"] == "strong"
+
+
+def test_decision_evaluation_emits_actionable_lessons_for_unverified_gaps():
+    from decision_evaluation import evaluate_run
+
+    evaluation = evaluate_run({
+        "requirements": [{"id": "r1", "title": "Login"}, {"id": "r2", "title": "Checkout"}],
+        "test_plan": [{"id": "t1", "requirement_id": "r1", "unverified": [{"target": "Moon"}]}],
+        "results": [],
+        "verification_problems": [{"target": "Moon"}],
+    })
+
+    assert evaluation["scores"]["requirements_coverage"] == 0.5
+    assert evaluation["scores"]["plan_grounding"] == 0.0
+    assert any("untested requirements" in lesson for lesson in evaluation["lessons"])
+    assert any("observed App Map" in lesson for lesson in evaluation["lessons"])

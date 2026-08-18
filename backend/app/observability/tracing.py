@@ -47,6 +47,10 @@ class ObservabilityBackend(Protocol):
                          output: Any = None, retry_count: int = 0,
                          context: dict[str, Any] | None = None) -> None: ...
 
+    def score_current_trace(self, name: str, value: float | str, *,
+                            data_type: str = "NUMERIC", comment: str | None = None,
+                            metadata: dict[str, Any] | None = None) -> None: ...
+
     def flush(self) -> None: ...
 
 
@@ -73,6 +77,11 @@ class NoopObservability:
     def record_exception(self, exception: BaseException, *, input: Any = None,
                          output: Any = None, retry_count: int = 0,
                          context: dict[str, Any] | None = None) -> None:
+        return None
+
+    def score_current_trace(self, name: str, value: float | str, *,
+                            data_type: str = "NUMERIC", comment: str | None = None,
+                            metadata: dict[str, Any] | None = None) -> None:
         return None
 
     def flush(self) -> None:

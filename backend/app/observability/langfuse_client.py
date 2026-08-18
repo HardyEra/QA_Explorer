@@ -202,6 +202,19 @@ class LangfuseObservability:
             # outer boundary in case a future implementation changes it.
             logger.exception("Failed to send exception to Langfuse")
 
+    def score_current_trace(
+        self, name: str, value: float | str, *, data_type: str = "NUMERIC",
+        comment: str | None = None, metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Send an evaluation score for the active pipeline trace."""
+        try:
+            self._client.score_current_trace(
+                name=name, value=value, data_type=data_type, comment=comment,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Failed to send Langfuse evaluation score %s", name)
+
     def flush(self) -> None:
         try:
             self._client.flush()
