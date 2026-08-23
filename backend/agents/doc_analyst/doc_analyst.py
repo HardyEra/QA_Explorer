@@ -92,6 +92,14 @@ class DocAnalyst:
             except Exception as exc:
                 logger.warning("Doc Analyst: could not read PDF %s (%s)", path.name, exc)
                 return ""
+        if path.suffix.casefold() == ".docx":
+            try:
+                from docx import Document
+
+                return "\n".join(paragraph.text for paragraph in Document(str(path)).paragraphs)
+            except Exception as exc:
+                logger.warning("Doc Analyst: could not read Word document %s (%s)", path.name, exc)
+                return ""
         try:
             return path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:

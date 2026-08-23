@@ -3,6 +3,7 @@
 import logging
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -159,6 +160,15 @@ class Explorer:
             for item in observation.inputs[:12]
             if isinstance(item, dict)
         ]
+        vision = getattr(observation, "vision_observation", None)
+        visual_summary = str(getattr(vision, "summary", "") or "")
+        visual_controls = []
+        for attribute in ("buttons", "links", "navigation", "forms", "inputs", "warnings"):
+            for value in getattr(vision, attribute, []) if vision else []:
+                value = " ".join(str(value).split())
+                if value and value not in visual_controls:
+                    visual_controls.append(value)
+        screenshot_path = self._save_evidence_screenshot(state.get("iterations", 0) + 1)
         self.execution_history.append(
             {
                 "action_type": "navigation",
@@ -168,11 +178,15 @@ class Explorer:
                 "controls": [control for control in observed_controls if control],
                 "control_roles": control_roles,
                 "inputs": observed_inputs,
+                "screenshot_path": screenshot_path,
+                "visual_summary": visual_summary,
+                "visual_controls": visual_controls,
                 "timestamp": self._timestamp(),
             }
         )
         self.on_event({"type": "observation", "url": observation.page.url,
-                       "status": "Observing page", "iteration": state.get("iterations", 0) + 1})
+                       "status": "Observing page", "iteration": state.get("iterations", 0) + 1,
+                       "screenshot_path": screenshot_path})
         logger.info(
             "Observation %s: title=%r url=%s actions=%s",
             state.get("iterations", 0) + 1,
@@ -190,6 +204,25 @@ class Explorer:
             "observation": observation,
             "iterations": state.get("iterations", 0) + 1,
         }
+
+    def _save_evidence_screenshot(self, iteration: int) -> str:
+        """Persist an immutable screenshot for this observed screen.
+
+        The live UI preview is intentionally separate: later test design must
+        refer to stable, run-scoped evidence rather than a single overwritten
+        ``latest.png`` file.
+        """
+        if not self.config.evidence_dir:
+            return ""
+        try:
+            evidence_dir = Path(self.config.evidence_dir)
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            path = evidence_dir / f"observation-{iteration:03d}.png"
+            self.browser.screenshot(str(path))
+            return str(path)
+        except Exception:
+            logger.warning("Could not save exploration screenshot evidence", exc_info=True)
+            return ""
 
     @traced_node("Discovery Agent.check_scope")
     def _check_scope(self, state: ExplorationState) -> dict[str, Any]:
@@ -441,7 +474,7 @@ class Explorer:
                     "timestamp": self._timestamp(),
                 }
                 if action_type == "fill":
-                    event["value"] = step.get("value")
+                    event["value"] = self._redact_evidence_value(target, step.get("value"))
                 self.execution_history.append(event)
 
             if step.get("type") == "click":
@@ -468,6 +501,15 @@ class Explorer:
             for item in getattr(observation, "inputs", [])
             if isinstance(item, dict)
         )
+
+    def _redact_evidence_value(self, target: object, value: object) -> object:
+        """Keep workflow evidence useful without serialising login secrets."""
+        target_text = str(target or "").casefold()
+        if "password" in target_text or value == self.config.password:
+            return "{password}"
+        if value == self.config.username:
+            return "{username}"
+        return value
 
     @staticmethod
     def _timestamp() -> str:

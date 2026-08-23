@@ -31,10 +31,19 @@ class AppMapBuilder:
             page = pages.setdefault(
                 url,
                 {"url": url, "title": str(event.get("page_title") or ""), "actions": [],
-                 "fills": [], "controls": [], "fields": [], "roles": {}},
+                 "fills": [], "controls": [], "fields": [], "roles": {}, "screenshots": [],
+                 "visual_summary": "", "visual_controls": []},
             )
             if event.get("page_title") and not page["title"]:
                 page["title"] = str(event["page_title"])
+            screenshot_path = str(event.get("screenshot_path") or "").strip()
+            if screenshot_path and screenshot_path not in page["screenshots"]:
+                page["screenshots"].append(screenshot_path)
+            if event.get("visual_summary") and not page["visual_summary"]:
+                page["visual_summary"] = str(event["visual_summary"])
+            for control in event.get("visual_controls") or []:
+                if control and control not in page["visual_controls"]:
+                    page["visual_controls"].append(str(control))
 
             action_type = str(event.get("action_type") or "")
             target = str(event.get("target") or "").strip()
@@ -114,6 +123,10 @@ class AppMapBuilder:
                     fields.append(descriptor)
             if fields:
                 lines.append(f"  Form fields: {', '.join(fields)}")
+            if page.get("visual_summary"):
+                lines.append(f"  Screenshot evidence: {page['visual_summary']}")
+            if page.get("visual_controls"):
+                lines.append(f"  Visually observed: {', '.join(page['visual_controls'][:MAX_ACTIONS_PER_PAGE])}")
         for transition in app_map.get("transitions", [])[:20]:
             lines.append(f"  Nav: {transition['from']} -> {transition['to']}")
         return "\n".join(lines)

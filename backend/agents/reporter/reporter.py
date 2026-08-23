@@ -99,8 +99,16 @@ class Reporter:
     @staticmethod
     def _build(run_id: str, requirements: list[dict], test_plan: list[dict],
                results: list[dict], blocked: list[dict]) -> dict:
+        evidence_by_test_id = {
+            case.get("id"): case.get("design_evidence", {}) for case in test_plan
+        }
         results = [
-            {**result, "explanation": Reporter._explain_result(result)} for result in results
+            {
+                **result,
+                "design_evidence": evidence_by_test_id.get(result.get("test_id"), {}),
+                "explanation": Reporter._explain_result(result),
+            }
+            for result in results
         ]
         by_status = {"passed": 0, "failed": 0, "error": 0}
         for result in results:

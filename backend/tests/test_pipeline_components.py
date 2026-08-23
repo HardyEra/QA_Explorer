@@ -5,6 +5,7 @@ documented fallback, and the orchestrator graph must compile and route.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -688,3 +689,78 @@ def test_decision_evaluation_emits_actionable_lessons_for_unverified_gaps():
     assert evaluation["scores"]["plan_grounding"] == 0.0
     assert any("untested requirements" in lesson for lesson in evaluation["lessons"])
     assert any("observed App Map" in lesson for lesson in evaluation["lessons"])
+
+
+def test_prd_evidence_links_verified_case_to_screenshot_and_workflow(tmp_path):
+    """A PRD-generated case retains inspectable evidence from exploration."""
+    from agents.test_verifier import TestVerifier
+
+    screenshot = tmp_path / "login.png"
+    screenshot.write_bytes(b"png")
+    app_map = {
+        "pages": [{
+            "url": "https://shop.test/login",
+            "title": "Login",
+            "actions": [{"label": "Log In", "succeeded": True}],
+            "fills": [{"field": "email"}, {"field": "password"}],
+            "controls": ["Log In"],
+            "fields": [
+                {"name": "email", "placeholder": "Email", "type": "email"},
+                {"name": "password", "placeholder": "Password", "type": "password"},
+            ],
+            "screenshots": [str(screenshot)],
+        }]
+    }
+    cases = [{
+        "id": "login-1",
+        "title": "Log in",
+        "steps": [
+            {"type": "fill", "target": "email", "value": "{username}"},
+            {"type": "fill", "target": "password", "value": "{password}"},
+            {"type": "click", "target": "Log In"},
+        ],
+        "expected": [{"type": "element_visible", "value": "Log In"}],
+    }]
+    workflow = {"steps": [
+        {"type": "fill", "target": "email", "value": "{username}"},
+        {"type": "fill", "target": "password", "value": "{password}"},
+        {"type": "click", "target": "Log In"},
+    ]}
+
+    verified, problems = TestVerifier().verify(cases, app_map, workflow)
+
+    assert not problems
+    assert verified[0]["design_evidence"]["screenshots"] == [str(screenshot)]
+    assert [step["target"] for step in verified[0]["design_evidence"]["workflow_steps"]] == [
+        "email", "password", "Log In"
+    ]
+
+
+def test_collect_documents_accepts_the_prd_file_types(tmp_path):
+    from pipeline_runner import collect_documents
+
+    for name in ("requirements.txt", "requirements.pdf", "requirements.docx", "notes.md"):
+        (tmp_path / name).write_bytes(b"test")
+
+    names = {Path(path).name for path in collect_documents(str(tmp_path))}
+    assert names == {"requirements.txt", "requirements.pdf", "requirements.docx"}
+
+
+def test_extractor_names_the_explicit_navigation_test_hooks():
+    from extractor import PageExtractor
+
+    class CartLink:
+        def evaluate(self, _script):
+            return "Shopping cart"
+
+    class OtherLink:
+        def evaluate(self, _script):
+            return ""
+
+    assert PageExtractor._semantic_test_label(CartLink()) == "Shopping cart"
+    class LogoutLink:
+        def evaluate(self, _script):
+            return "Logout"
+
+    assert PageExtractor._semantic_test_label(LogoutLink()) == "Logout"
+    assert PageExtractor._semantic_test_label(OtherLink()) == ""

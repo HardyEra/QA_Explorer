@@ -95,13 +95,18 @@ class AppMapStore:
                         "controls": list(page.get("controls", [])),
                         "fields": list(page.get("fields", [])),
                         "roles": dict(page.get("roles", {})),
+                        "screenshots": list(page.get("screenshots", [])),
+                        "visual_summary": page.get("visual_summary", ""),
+                        "visual_controls": list(page.get("visual_controls", [])),
                     }
                     continue
                 if page.get("title") and not existing.get("title"):
                     existing["title"] = page["title"]
-                for key in ("actions", "fills", "controls", "fields"):
+                for key in ("actions", "fills", "controls", "fields", "screenshots", "visual_controls"):
                     merge_list(existing.setdefault(key, []), page.get(key, []))
                 existing.setdefault("roles", {}).update(page.get("roles", {}))
+                if page.get("visual_summary") and not existing.get("visual_summary"):
+                    existing["visual_summary"] = page["visual_summary"]
 
         transitions: list[dict] = []
         for source in (old.get("transitions", []), new.get("transitions", [])):

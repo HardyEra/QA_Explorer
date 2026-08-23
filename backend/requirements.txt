@@ -10,3 +10,4 @@ langgraph-checkpoint-sqlite
 langfuse>=4.7.0
 streamlit
 pypdf
+python-docx

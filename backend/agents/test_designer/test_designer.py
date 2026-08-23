@@ -40,6 +40,13 @@ Observed application map (real pages and controls discovered by exploring the
 live application; prefer these exact labels for click targets):
 {app_map}
 
+Captured workflow evidence (successful actions collected during this exploration):
+{workflow}
+
+Every test must remain traceable to the PRD and observed evidence. Prefer the
+workflow's exact actions when it covers a requirement. Do not claim a screen,
+field, control, or result absent from the application map or workflow.
+
 Credentials: {credentials_note}
 
 Application context supplied by the user (authoritative for account roles and
@@ -156,6 +163,7 @@ class TestDesigner:
         feature_locations: list[dict] | None = None,
         detected_role: str = "",
         assets: list[str] | None = None,
+        workflow: dict | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """Return ``(test_cases, blocked_requirements)`` for one feature."""
         with self.observability.span(
@@ -165,7 +173,7 @@ class TestDesigner:
             payload = self.model_client.complete_json(
                 "Test Designer.design_cases",
                 self._prompt(feature, requirements, app_map, has_credentials, critique,
-                             application_context, feature_locations, detected_role, assets),
+                             application_context, feature_locations, detected_role, assets, workflow),
             )
             cases = self._from_payload(payload, feature)
             blocked = self._blocked_from_payload(payload, feature, requirements)
@@ -197,6 +205,7 @@ class TestDesigner:
         feature_locations: list[dict] | None = None,
         detected_role: str = "",
         assets: list[str] | None = None,
+        workflow: dict | None = None,
     ) -> str:
         requirement_lines = json.dumps(
             [
@@ -234,6 +243,7 @@ class TestDesigner:
             feature_locations="\n".join(location_lines) or "No map analysis available.",
             assets_note=", ".join(assets) if assets else
             "none stored — do NOT design upload steps",
+            workflow=json.dumps(workflow or {}, ensure_ascii=False),
             feature=feature or "general application smoke",
             requirements=requirement_lines,
             app_map=AppMapBuilder.compact_text(app_map) or "No exploration data available.",

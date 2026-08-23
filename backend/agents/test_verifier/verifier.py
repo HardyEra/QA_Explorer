@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from observability.tracing import NoopObservability
 
@@ -49,8 +50,15 @@ class TestVerifier:
     def __init__(self, observability=None):
         self.observability = observability or NoopObservability()
 
-    def verify(self, test_cases: list[dict], app_map: dict) -> tuple[list[dict], list[dict]]:
-        """Return ``(cases, problems)``; cases keep every step, flagged if unverifiable."""
+    def verify(
+        self, test_cases: list[dict], app_map: dict, workflow: dict | None = None
+    ) -> tuple[list[dict], list[dict]]:
+        """Verify cases against controls, input events, workflows, and screenshots.
+
+        Screenshots are immutable exploration evidence. Their pixels are not
+        guessed at; their saved paths are attached to each grounded case so a
+        reviewer can inspect the exact observed screens behind a test.
+        """
         known_controls, known_fields = self._inventory(app_map)
         if not known_controls and not known_fields:
             logger.info("Verifier: no observed inventory available; skipping verification")
@@ -65,7 +73,7 @@ class TestVerifier:
         ) as span:
             for case in test_cases:
                 case, case_problems, case_corrections = self._verify_case(
-                    case, known_controls, known_fields
+                    case, known_controls, known_fields, app_map, workflow or {}
                 )
                 corrections += case_corrections
                 problems.extend(case_problems)
@@ -101,8 +109,8 @@ class TestVerifier:
                     fields.setdefault(_normalise(value), value)
         return controls, fields
 
-    def _verify_case(self, case: dict, controls: dict[str, str],
-                     fields: dict[str, str]) -> tuple[dict, list[dict], int]:
+    def _verify_case(self, case: dict, controls: dict[str, str], fields: dict[str, str],
+                     app_map: dict, workflow: dict) -> tuple[dict, list[dict], int]:
         problems: list[dict] = []
         corrections = 0
         steps = []
@@ -138,10 +146,39 @@ class TestVerifier:
 
         expected, expectation_problems = self._verify_expectations(case, controls, fields)
         problems.extend(expectation_problems)
-        verified_case = {**case, "steps": steps, "expected": expected}
+        verified_case = {
+            **case,
+            "steps": steps,
+            "expected": expected,
+            "design_evidence": self._case_evidence(steps, app_map, workflow),
+        }
         if problems:
             verified_case["unverified"] = [problem["reason"] for problem in problems]
         return verified_case, problems, corrections
+
+    @staticmethod
+    def _case_evidence(steps: list[dict], app_map: dict, workflow: dict) -> dict:
+        """Return the screenshots and observed workflow actions supporting a case."""
+        targets = {_normalise(step.get("target", "")) for step in steps if step.get("target")}
+        screenshots: list[str] = []
+        for page in app_map.get("pages", []):
+            page_targets = {
+                _normalise(action.get("label", "")) for action in page.get("actions", [])
+            }
+            page_targets.update(_normalise(control) for control in page.get("controls", []))
+            page_targets.update(
+                _normalise(field.get(key, ""))
+                for field in page.get("fields", []) for key in ("name", "placeholder")
+            )
+            if targets & page_targets:
+                for path in page.get("screenshots", []):
+                    if path and Path(path).is_file() and path not in screenshots:
+                        screenshots.append(path)
+        workflow_steps = [
+            step for step in workflow.get("steps", [])
+            if _normalise(step.get("target", "")) in targets
+        ]
+        return {"screenshots": screenshots, "workflow_steps": workflow_steps}
 
     def _verify_expectations(self, case: dict, controls: dict[str, str],
                              fields: dict[str, str]) -> tuple[list[dict], list[dict]]:

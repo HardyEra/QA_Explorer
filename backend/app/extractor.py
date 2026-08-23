@@ -359,6 +359,7 @@ class PageExtractor:
                     text = (
                         self._safe_text(element)
                         or ("Choose Files" if action_type == "file_upload" else "")
+                        or self._semantic_test_label(element)
                         or self._semantic_icon_label(element)
                     )
 
@@ -589,6 +590,30 @@ class PageExtractor:
                         return 'Open navigation menu';
                     }
                     return '';
+                }"""
+            ) or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _semantic_test_label(element):
+        """Name the one explicitly identified, otherwise unlabeled cart link.
+
+        Some test applications expose key navigation only through stable
+        semantic hooks. A cart link can be entirely unlabeled, while a sidebar
+        logout entry can lose its text during a transient menu render. Keep
+        these exceptions exact rather than inferring actions from CSS names or
+        arbitrary implementation ids.
+        """
+        try:
+            return element.evaluate(
+                """node => {
+                    const hook = (node.getAttribute('data-test') || '').trim().toLowerCase();
+                    const labels = {
+                        'shopping-cart-link': 'Shopping cart',
+                        'logout-sidebar-link': 'Logout',
+                    };
+                    return labels[hook] || '';
                 }"""
             ) or ""
         except Exception:

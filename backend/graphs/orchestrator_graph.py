@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import operator
+from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -59,6 +60,9 @@ class PipelineState(TypedDict, total=False):
     results: Annotated[list[dict[str, Any]], operator.add]
 
     app_map: dict[str, Any]
+    evidence_map: dict[str, Any]
+    exploration_history: list[dict[str, Any]]
+    workflow: dict[str, Any]
     semantic_map: dict[str, Any]
     design_rounds: int
     critique: dict[str, Any]
@@ -231,6 +235,10 @@ class QAOrchestrator:
                 application_context=self._prd_seeded_context(state, store.load(state["start_url"])),
                 username=state.get("username", ""),
                 password=state.get("password", ""),
+                evidence_dir=str(
+                    Path(__file__).resolve().parent.parent / "generated" / "evidence"
+                    / state.get("run_id", "run") / "exploration"
+                ),
                 hitl_wait_seconds=state.get("hitl_wait_seconds", 0),
             )
             explorer = Explorer(browser, config, self.observability, on_event=explorer_event,
@@ -242,14 +250,26 @@ class QAOrchestrator:
             except Exception:
                 logger.warning("Could not close the exploration browser cleanly", exc_info=True)
 
-        fresh_map = AppMapBuilder().build(
-            state["start_url"], result.get("exploration_history", [])
-        )
+        history = result.get("exploration_history", [])
+        fresh_map = AppMapBuilder().build(state["start_url"], history)
         logger.info("App Map built this run: %s page(s)", len(fresh_map["pages"]))
         fresh_map = self._reconnoitre(state, fresh_map)
         # Knowledge compounds: this run's observations join every earlier run's.
         app_map = store.merge_and_save(state["start_url"], fresh_map)
-        updates: dict[str, Any] = {"app_map": app_map}
+        from agents.flow_generator import FlowGenerator
+
+        workflow = FlowGenerator().generate_json(history)
+        updates: dict[str, Any] = {
+            "app_map": app_map,
+            "evidence_map": fresh_map,
+            "exploration_history": history,
+            "workflow": workflow,
+        }
+        self.on_event({
+            "type": "status",
+            "status": f"Exploration complete — captured {len(history)} action event(s) and "
+                      f"{len(workflow.get('steps', []))} workflow step(s) for test evidence.",
+        })
         if explorer.live_guidance:
             # Whatever the tester taught the explorer also informs test design.
             updates["application_context"] = (
@@ -317,14 +337,15 @@ class QAOrchestrator:
         )
         if not has_document_requirements:
             synthesized = self.cartographer.synthesize_requirements(
-                state.get("app_map", {}), state.get("application_context", "")
+                state.get("evidence_map") or state.get("app_map", {}),
+                state.get("application_context", ""),
             )
             if synthesized:
                 updates["requirements"] = synthesized
                 requirements = requirements + synthesized
         updates["semantic_map"] = self.cartographer.map_features(
             requirements,
-            state.get("app_map", {}),
+            state.get("evidence_map") or state.get("app_map", {}),
             state.get("application_context", ""),
         )
         return updates
@@ -377,13 +398,14 @@ class QAOrchestrator:
                 {
                     "feature": feature,
                     "feature_requirements": requirements,
-                    "app_map": state.get("app_map", {}),
+                    "app_map": state.get("evidence_map") or state.get("app_map", {}),
                     "start_url": state["start_url"],
                     "has_credentials": bool(state.get("username")),
                     "application_context": state.get("application_context", ""),
                     "feature_locations": self._feature_locations(state, requirements),
                     "detected_role": detected_role,
                     "assets": self._stored_asset_names(),
+                    "workflow": state.get("workflow", {}),
                     "critique_note": "",
                 },
             )
@@ -402,6 +424,7 @@ class QAOrchestrator:
             feature_locations=state.get("feature_locations"),
             detected_role=state.get("detected_role", ""),
             assets=state.get("assets"),
+            workflow=state.get("workflow"),
         )
         return {"test_cases": cases, "blocked": blocked}
 
@@ -432,13 +455,14 @@ class QAOrchestrator:
                 {
                     "feature": feature,
                     "feature_requirements": groups.get(feature, []),
-                    "app_map": state.get("app_map", {}),
+                    "app_map": state.get("evidence_map") or state.get("app_map", {}),
                     "start_url": state["start_url"],
                     "has_credentials": bool(state.get("username")),
                     "application_context": state.get("application_context", ""),
                     "feature_locations": self._feature_locations(state, groups.get(feature, [])),
                     "detected_role": state.get("semantic_map", {}).get("detected_role", "unknown"),
                     "assets": self._stored_asset_names(),
+                    "workflow": state.get("workflow", {}),
                     "critique_note": "\n".join(notes),
                 },
             )
@@ -484,7 +508,9 @@ class QAOrchestrator:
         # Verify every designed step against the observed control inventory:
         # near-misses are corrected to real labels, unverifiable targets are
         # flagged so the report can say so instead of blaming the application.
-        plan, verification_problems = self.verifier.verify(plan, state.get("app_map", {}))
+        plan, verification_problems = self.verifier.verify(
+            plan, state.get("evidence_map") or state.get("app_map", {}), state.get("workflow", {})
+        )
         if verification_problems:
             self.on_event({
                 "type": "warning",

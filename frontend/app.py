@@ -400,6 +400,17 @@ def render_pipeline_report(report: dict) -> None:
                     st.markdown(f"*What it tests:* {result['description']}")
                 if result.get("explanation"):
                     st.markdown(f"*Outcome:* {result['explanation']}")
+                design_evidence = result.get("design_evidence") or {}
+                screenshots = [
+                    path for path in design_evidence.get("screenshots", []) if Path(path).exists()
+                ]
+                if screenshots:
+                    st.caption("Exploration screenshot evidence used to ground this test")
+                    st.image(screenshots, use_container_width=True)
+                workflow_steps = design_evidence.get("workflow_steps", [])
+                if workflow_steps:
+                    st.caption("Matched captured workflow actions")
+                    st.code(str(workflow_steps), language=None)
                 st.divider()
 
     coverage = report.get("coverage", [])
@@ -491,16 +502,8 @@ if st.session_state.pop("run_failed_no_report", False):
 form_col, guide_col = st.columns([1.55, 1], gap="large")
 with form_col:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown('<p class="panel-title">New run</p><p class="panel-subtitle">Start with a URL, then add only the context the agents need.</p>', unsafe_allow_html=True)
-    run_mode = st.radio(
-        "Run mode",
-        ["Full QA pipeline", "Exploration only"],
-        horizontal=True,
-        help="The full pipeline analyses your docs, explores the app, designs and executes "
-             "test cases in parallel, and produces a QA report. Exploration only runs the "
-             "original discovery agent.",
-    )
-    pipeline_mode = run_mode == "Full QA pipeline"
+    st.markdown('<p class="panel-title">New PRD-driven QA run</p><p class="panel-subtitle">Upload the PRD, then the agent explores the matching product workflows and verifies evidence-grounded tests.</p>', unsafe_allow_html=True)
+    pipeline_mode = True
     with st.form("exploration_form", clear_on_submit=False):
         website_url = st.text_input("Target URL", placeholder="https://app.example.com", help="The application entry point to explore.")
         credentials_col, steps_col = st.columns([1.5, 1])
@@ -510,26 +513,21 @@ with form_col:
                 password = st.text_input("Password", type="password")
         with steps_col:
             max_steps = st.number_input("Exploration depth", min_value=1, max_value=500, value=30, step=5, help="Maximum actions the agent may take.")
-        exploration_goal = st.text_area("What should the agent accomplish?", placeholder="Example: Open Candidates, find Nicole, update the candidate name to Max, save, then log out.", height=110)
+        exploration_goal = st.text_area("Additional exploration focus (optional)", placeholder="Example: Prioritise candidate creation and editing workflows.", height=110)
         application_context = st.text_area("Application context (optional)", placeholder="Important roles, rules, modules, or areas to prioritise and avoid.", height=80)
         if pipeline_mode:
             uploaded_docs = st.file_uploader(
-                "PRD and product documents (optional)",
-                type=["md", "txt", "pdf"],
+                "Product requirements document (required)",
+                type=["txt", "pdf", "docx"],
                 accept_multiple_files=True,
-                help="Requirements are extracted from these documents and every test case "
-                     "traces back to one of them.",
+                help="Upload the detailed English PRD. It directs exploration, workflow capture, test design, and verification.",
             )
             pipeline_col_a, pipeline_col_b = st.columns(2)
             with pipeline_col_a:
                 workers = st.number_input("Parallel workers", min_value=1, max_value=8, value=3,
                                           help="Parallel budget for document analysis, test design, and test execution.")
             with pipeline_col_b:
-                skip_exploration = st.checkbox(
-                    "Skip exploration (design from documents only)",
-                    value=False,
-                    help="Faster, but test cases lose grounding in the observed UI.",
-                )
+                skip_exploration = False
                 preserve_session = st.checkbox(
                     "Reuse login session across tests",
                     value=False,
@@ -544,7 +542,7 @@ with form_col:
                          "you in the chat and waits up to 120 seconds for your reply.",
                 )
         submitted = st.form_submit_button(
-            "Start QA pipeline" if pipeline_mode else "Start exploration",
+            "Start PRD-driven QA run",
             type="primary",
             use_container_width=True,
         )
@@ -656,6 +654,8 @@ with guide_col:
 if submitted:
     if not is_valid_url(website_url):
         st.error("Enter a complete http:// or https:// URL to begin.")
+    elif pipeline_mode and not uploaded_docs:
+        st.error("Upload a detailed PRD in .txt, .pdf, or .docx format before starting.")
     elif pipeline_mode:
         doc_paths = save_uploaded_docs(uploaded_docs)
         pipeline_inputs = {
@@ -672,18 +672,6 @@ if submitted:
             "hitl_wait_seconds": 120 if ask_when_stuck else 0,
         }
         start_active_run("pipeline", pipeline_inputs, "QA pipeline")
-        st.rerun()
-    else:
-        run_inputs = {
-            "start_url": website_url.strip(),
-            "username": username,
-            "password": password,
-            "application_context": application_context,
-            "exploration_goal": exploration_goal,
-            "max_steps": int(max_steps),
-            "hitl_wait_seconds": 120,
-        }
-        start_active_run("exploration", run_inputs, "Exploration")
         st.rerun()
 
 if st.session_state.get("pipeline_report"):

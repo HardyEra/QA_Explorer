@@ -5,8 +5,8 @@ Usage (from the repository root, virtualenv active):
     python backend/app/pipeline_runner.py --url https://www.saucedemo.com \
         --docs backend/docs --username standard_user --password secret_sauce
 
-Programmatic use mirrors ``runner.run_exploration``: call ``run_pipeline`` and
-optionally pass ``on_event`` for progress callbacks.
+Programmatic use mirrors ``runner.run_exploration``: call ``run_pipeline`` with
+a required PRD and optionally pass ``on_event`` for progress callbacks.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from graphs.orchestrator_graph import PipelineState, QAOrchestrator  # noqa: E40
 
 logger = logging.getLogger(__name__)
 
-DOC_SUFFIXES = {".md", ".txt", ".pdf"}
+DOC_SUFFIXES = {".txt", ".pdf", ".docx"}
 CHECKPOINT_PATH = _BACKEND_ROOT / "runtime" / "checkpoints" / "pipeline.db"
 RUNS_STORE = _BACKEND_ROOT / "generated" / "runs"
 FEEDBACK_PATH = _BACKEND_ROOT / "generated" / "memory" / "feedback.md"
@@ -196,6 +196,9 @@ def _store_run(run_id: str, final_state: dict[str, Any]) -> None:
         "goal": final_state.get("goal", ""),
         "requirements": final_state.get("requirements", []),
         "semantic_map": final_state.get("semantic_map", {}),
+        "exploration_history": final_state.get("exploration_history", []),
+        "workflow": final_state.get("workflow", {}),
+        "evidence_map": final_state.get("evidence_map", {}),
         "test_plan": final_state.get("test_plan", []),
         "blocked": final_state.get("blocked", []),
         "summary": final_state.get("report", {}).get("summary", {}),
@@ -252,6 +255,10 @@ def run_pipeline(
     observability = create_observability()
     run_id = resume_run_id or uuid4().hex[:12]
     doc_paths = collect_documents(docs)
+    if not doc_paths:
+        raise ValueError("A PRD is required. Upload a non-empty .txt, .pdf, or .docx product document.")
+    if skip_exploration:
+        raise ValueError("PRD-driven QA always explores the website before designing tests.")
 
     feedback = load_feedback()
     if feedback:
@@ -274,7 +281,7 @@ def run_pipeline(
 
     callback({"type": "started", "run_id": run_id, "status": "Pipeline starting",
               "docs": len(doc_paths), "url": start_url})
-    logger.info("Pipeline %s: %s document(s), start_url=%s", run_id, len(doc_paths), start_url)
+    logger.info("PRD-driven pipeline %s: %s document(s), start_url=%s", run_id, len(doc_paths), start_url)
 
     state: PipelineState = {
         "run_id": run_id,
@@ -365,15 +372,13 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Run the multi-agent QA pipeline")
     parser.add_argument("--url", required=True, help="Application start URL")
-    parser.add_argument("--docs", default=None,
-                        help="Directory or comma-separated list of PRD/product docs (.md/.txt/.pdf)")
+    parser.add_argument("--docs", required=True,
+                        help="Required PRD/product document(s): .txt, .pdf, or .docx")
     parser.add_argument("--username", default="")
     parser.add_argument("--password", default="")
     parser.add_argument("--goal", default="", help="Optional exploration goal")
     parser.add_argument("--context", default="", help="Optional application context")
     parser.add_argument("--max-steps", type=int, default=12, help="Discovery observation budget")
-    parser.add_argument("--skip-exploration", action="store_true",
-                        help="Design tests from documents only (no Discovery run)")
     parser.add_argument("--preserve-session", action="store_true",
                         help="Log in once and reuse the session across tests (skips per-test logins)")
     parser.add_argument("--workers", type=int, default=3,
@@ -390,7 +395,6 @@ def main() -> None:
         goal=args.goal,
         application_context=args.context,
         max_steps=args.max_steps,
-        skip_exploration=args.skip_exploration,
         preserve_session=args.preserve_session,
         max_concurrency=args.workers,
         resume_run_id=args.resume,

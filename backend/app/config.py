@@ -21,6 +21,7 @@ class ExplorationConfig:
                  application_context="",
                  username="",
                  password="",
+                 evidence_dir="",
                  hitl_wait_seconds=0):
 
         self.start_url = start_url
@@ -35,6 +36,9 @@ class ExplorationConfig:
         self.application_context = application_context
         self.username = username
         self.password = password
+        # A PRD-driven run keeps immutable screenshots for every observed
+        # screen.  Downstream design and verification use these as evidence.
+        self.evidence_dir = evidence_dir
         # >0 enables "ask the tester when stuck" during exploration.
         self.hitl_wait_seconds = hitl_wait_seconds
 
