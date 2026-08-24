@@ -52,6 +52,7 @@ class PipelineState(TypedDict, total=False):
     session_state_path: str
     hitl_wait_seconds: int
     doc_paths: list[str]
+    custom_locators: list[dict[str, str]]
 
     # Fan-in channels: parallel branches append, LangGraph merges.
     requirements: Annotated[list[dict[str, Any]], operator.add]
@@ -225,6 +226,7 @@ class QAOrchestrator:
 
         try:
             browser.start(observability=self.observability)
+            browser.set_custom_locators(state.get("custom_locators", []))
             browser.open(state["start_url"])
             config = ExplorationConfig(
                 start_url=state["start_url"],
@@ -239,6 +241,7 @@ class QAOrchestrator:
                     Path(__file__).resolve().parent.parent / "generated" / "evidence"
                     / state.get("run_id", "run") / "exploration"
                 ),
+                custom_locators=state.get("custom_locators", []),
                 hitl_wait_seconds=state.get("hitl_wait_seconds", 0),
             )
             explorer = Explorer(browser, config, self.observability, on_event=explorer_event,

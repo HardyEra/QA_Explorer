@@ -18,7 +18,7 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "logout": ("logout", "log out", "sign out"),
     "checkout": ("checkout", "place order", "complete order", "payment"),
     "purchase": (
-        "add to cart", "add to bag", "buy now", "shopping cart", "view cart",
+        "add to cart", "add to bag", "buy now", "shopping cart", "view cart", "cart",
         "order now", "purchase",
     ),
     "authentication": (

@@ -109,6 +109,11 @@ class BrowserController:
         self.base_domain = urlparse(start_url).netloc
         self.follow_external = follow_external
 
+    def set_custom_locators(self, custom_locators):
+        """Install validated, user-provided control fallbacks for this run only."""
+        if self.extractor is not None:
+            self.extractor.custom_locators = list(custom_locators or [])
+
     def _handle_new_page(self, popup):
         if self.explore_new_tabs or popup == self.page:
             return

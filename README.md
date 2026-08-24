@@ -18,6 +18,12 @@ When `GEMINI_API_KEY` is configured, the screenshot observer also supplies a
 strict visual summary to test design; DOM/accessibility evidence remains the
 fallback when vision is unavailable.
 
+If a key control is missing a usable accessible name, expand **Custom control
+fallback** in the run form. Enter the control's short PRD-facing name (for
+example, `cart`) and paste its HTML element. QA Explorer derives a selector
+from `data-test`, `data-testid`, `id`, `aria-label`, or `name`, checks it is
+visible on the current page, and uses it only when normal discovery missed it.
+
 ## Repository layout
 
 ```text

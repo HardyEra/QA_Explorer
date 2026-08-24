@@ -764,3 +764,25 @@ def test_extractor_names_the_explicit_navigation_test_hooks():
 
     assert PageExtractor._semantic_test_label(LogoutLink()) == "Logout"
     assert PageExtractor._semantic_test_label(OtherLink()) == ""
+
+
+def test_pasted_html_becomes_a_semantic_custom_locator():
+    from custom_locators import build_custom_locator
+
+    locator = build_custom_locator(
+        "cart", '<a class="shopping_cart_link" data-test="shopping-cart-link"></a>'
+    )
+
+    assert locator == {
+        "name": "cart",
+        "selector": '[data-test="shopping-cart-link"]',
+        "attribute": "data-test",
+    }
+
+
+def test_custom_cart_name_is_ranked_as_a_purchase_action():
+    from action_classifier import ActionClassifier
+    from models import Action
+
+    classified = ActionClassifier().classify(Action(id=1, text="cart", type="custom_click"))
+    assert classified.category == "purchase"

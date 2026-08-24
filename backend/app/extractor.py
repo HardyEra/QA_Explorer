@@ -21,12 +21,13 @@ logger = logging.getLogger(__name__)
 
 class PageExtractor:
 
-    def __init__(self, page, action_registry):
+    def __init__(self, page, action_registry, custom_locators=None):
         self.page = page
         self.action_registry = action_registry
         self.deduplicator = ActionDeduplicator()
         self.accessibility_extractor = AccessibilityExtractor(page, action_registry)
         self.page_summary_generator = PageSummaryGenerator()
+        self.custom_locators = list(custom_locators or [])
         self._overlay = {"ui_context": "NORMAL_PAGE", "action_context": "page", "container": None, "selector": None}
 
     def _detect_active_overlay(self):
@@ -397,6 +398,7 @@ class PageExtractor:
         # card handler without needing a force click or implementation-specific
         # CSS selector.
         actions.extend(self._dialog_option_actions())
+        actions.extend(self._custom_locator_actions(actions))
 
         if self._overlay["ui_context"] != "NORMAL_PAGE":
             logger.info(
@@ -407,6 +409,36 @@ class PageExtractor:
             logger.info("Background actions suppressed: active overlay is the only extraction surface")
 
         return actions
+
+    def _custom_locator_actions(self, actions):
+        """Offer user-provided semantic locators only when discovery missed them."""
+        found = {self._normalise_label(action.text).casefold() for action in actions}
+        fallbacks = []
+        for item in self.custom_locators:
+            name = self._normalise_label(item.get("name", ""))
+            selector = str(item.get("selector") or "")
+            if not name or not selector or name.casefold() in found:
+                continue
+            try:
+                locator = self._surface().locator(selector)
+                if not locator.count() or not locator.first.is_visible():
+                    continue
+                action_id = self.action_registry.register(locator, name, "custom_click")
+                fallbacks.append(
+                    Action(
+                        id=action_id,
+                        text=name,
+                        type="custom_click",
+                        **self._action_context(locator.first),
+                        context=self._overlay["action_context"],
+                        container=self._overlay.get("container"),
+                    )
+                )
+                found.add(name.casefold())
+                logger.info("Added user-provided locator fallback %r via %s", name, selector)
+            except Exception:
+                logger.debug("Custom locator fallback could not be used: %s", selector, exc_info=True)
+        return fallbacks
 
     def _dialog_option_actions(self):
         """Find visible, card-like choices in a dialog with missing semantics.

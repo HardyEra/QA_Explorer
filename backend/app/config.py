@@ -22,6 +22,7 @@ class ExplorationConfig:
                  username="",
                  password="",
                  evidence_dir="",
+                 custom_locators=None,
                  hitl_wait_seconds=0):
 
         self.start_url = start_url
@@ -39,6 +40,7 @@ class ExplorationConfig:
         # A PRD-driven run keeps immutable screenshots for every observed
         # screen.  Downstream design and verification use these as evidence.
         self.evidence_dir = evidence_dir
+        self.custom_locators = list(custom_locators or [])
         # >0 enables "ask the tester when stuck" during exploration.
         self.hitl_wait_seconds = hitl_wait_seconds
 

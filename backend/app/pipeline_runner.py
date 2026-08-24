@@ -199,6 +199,7 @@ def _store_run(run_id: str, final_state: dict[str, Any]) -> None:
         "exploration_history": final_state.get("exploration_history", []),
         "workflow": final_state.get("workflow", {}),
         "evidence_map": final_state.get("evidence_map", {}),
+        "custom_locators": final_state.get("custom_locators", []),
         "test_plan": final_state.get("test_plan", []),
         "blocked": final_state.get("blocked", []),
         "summary": final_state.get("report", {}).get("summary", {}),
@@ -233,6 +234,7 @@ def run_pipeline(
     *,
     start_url: str,
     docs: str | None = None,
+    custom_locators: list[dict[str, str]] | None = None,
     username: str = "",
     password: str = "",
     goal: str = "",
@@ -295,6 +297,7 @@ def run_pipeline(
         "preserve_session": preserve_session,
         "hitl_wait_seconds": hitl_wait_seconds,
         "doc_paths": doc_paths,
+        "custom_locators": list(custom_locators or []),
         # Tester-written requirements and cases join every run alongside the
         # document/exploration-derived ones.
         "requirements": load_custom_requirements(),

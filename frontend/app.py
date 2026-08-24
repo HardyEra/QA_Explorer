@@ -21,6 +21,7 @@ for path in (BACKEND_ROOT, BACKEND_APP):
         sys.path.insert(0, str(path))
 
 from asset_manager import AssetManager  # noqa: E402
+from custom_locators import build_custom_locator  # noqa: E402
 from guidance import GuidanceChannel  # noqa: E402
 from pipeline_runner import (  # noqa: E402
     add_custom_requirement,
@@ -515,6 +516,21 @@ with form_col:
             max_steps = st.number_input("Exploration depth", min_value=1, max_value=500, value=30, step=5, help="Maximum actions the agent may take.")
         exploration_goal = st.text_area("Additional exploration focus (optional)", placeholder="Example: Prioritise candidate creation and editing workflows.", height=110)
         application_context = st.text_area("Application context (optional)", placeholder="Important roles, rules, modules, or areas to prioritise and avoid.", height=80)
+        with st.expander("Custom control fallback (optional)"):
+            custom_locator_name = st.text_input(
+                "Control name used in the PRD",
+                placeholder="cart",
+                key="custom_locator_name_input",
+                help="Use a short, meaningful name. The agent maps PRD wording such as 'shopping cart' to this control.",
+            )
+            custom_locator_html = st.text_area(
+                "Paste the element HTML",
+                placeholder='<a data-test="shopping-cart-link"></a>',
+                height=90,
+                key="custom_locator_html_input",
+                help="Paste one element from browser developer tools. The app derives a safe selector from data-test, id, aria-label, or name.",
+            )
+            add_custom_locator = st.form_submit_button("Add custom control")
         if pipeline_mode:
             uploaded_docs = st.file_uploader(
                 "Product requirements document (required)",
@@ -546,6 +562,30 @@ with form_col:
             type="primary",
             use_container_width=True,
         )
+    if add_custom_locator:
+        try:
+            locator = build_custom_locator(custom_locator_name, custom_locator_html)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            locators = st.session_state.setdefault("run_custom_locators", [])
+            if locator in locators:
+                st.info("That custom control has already been added to this run.")
+            else:
+                locators.append(locator)
+                st.success(f"Added custom control: {locator['name']}")
+
+    run_custom_locators = st.session_state.setdefault("run_custom_locators", [])
+    if run_custom_locators:
+        st.markdown("<p class='panel-subtitle'>Custom controls for this run</p>", unsafe_allow_html=True)
+        for index, locator in enumerate(run_custom_locators):
+            details_col, remove_col = st.columns([5, 1])
+            details_col.caption(
+                f"**{locator['name']}**  ·  `{locator['selector']}`  ·  via {locator['attribute']}"
+            )
+            if remove_col.button("Remove", key=f"remove_custom_locator_{index}"):
+                run_custom_locators.pop(index)
+                st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
 with guide_col:
@@ -661,6 +701,7 @@ if submitted:
         pipeline_inputs = {
             "start_url": website_url.strip(),
             "docs": ",".join(doc_paths) if doc_paths else None,
+            "custom_locators": list(st.session_state.get("run_custom_locators", [])),
             "username": username,
             "password": password,
             "goal": exploration_goal,
@@ -672,6 +713,9 @@ if submitted:
             "hitl_wait_seconds": 120 if ask_when_stuck else 0,
         }
         start_active_run("pipeline", pipeline_inputs, "QA pipeline")
+        # The worker received an immutable copy. Do not carry one run's
+        # application-specific selectors into the next run by accident.
+        st.session_state["run_custom_locators"] = []
         st.rerun()
 
 if st.session_state.get("pipeline_report"):
