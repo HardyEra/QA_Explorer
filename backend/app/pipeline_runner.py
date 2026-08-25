@@ -240,6 +240,7 @@ def run_pipeline(
     max_concurrency: int = 3,
     resume_run_id: str | None = None,
     hitl_wait_seconds: int = 0,
+    show_browser: bool = False,
     guidance=None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -287,6 +288,7 @@ def run_pipeline(
         "skip_exploration": skip_exploration,
         "preserve_session": preserve_session,
         "hitl_wait_seconds": hitl_wait_seconds,
+        "execution_headless": not show_browser,
         "doc_paths": doc_paths,
         # Tester-written requirements and cases join every run alongside the
         # document/exploration-derived ones.

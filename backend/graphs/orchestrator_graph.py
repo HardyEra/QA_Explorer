@@ -50,6 +50,7 @@ class PipelineState(TypedDict, total=False):
     preserve_session: bool
     session_state_path: str
     hitl_wait_seconds: int
+    execution_headless: bool
     doc_paths: list[str]
 
     # Fan-in channels: parallel branches append, LangGraph merges.
@@ -79,7 +80,7 @@ class QAOrchestrator:
         self.cartographer = Cartographer(self.observability)
         self.designer = TestDesigner(self.observability)
         self.critic = CoverageCritic(self.observability)
-        self.executor = ExecutorAgent(self.observability)
+        self.executor = ExecutorAgent(self.observability, on_event=self.on_event)
         self.verifier = TestVerifier(self.observability)
         self.reporter = Reporter(self.observability)
         self.max_steps_default = max_steps_default
@@ -536,6 +537,7 @@ class QAOrchestrator:
                     "password": state.get("password", ""),
                     "run_id": state.get("run_id", "run"),
                     "session_state_path": state.get("session_state_path", ""),
+                    "execution_headless": state.get("execution_headless", True),
                 },
             )
             for case in plan
@@ -549,6 +551,7 @@ class QAOrchestrator:
             password=state.get("password", ""),
             run_id=state.get("run_id", "run"),
             session_state_path=state.get("session_state_path") or None,
+            headless=state.get("execution_headless", True),
         )
         return {"results": [result]}
 

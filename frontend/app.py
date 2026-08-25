@@ -32,6 +32,7 @@ from pipeline_runner import (  # noqa: E402
     save_feedback,
 )
 from runner import run_exploration  # noqa: E402
+from task_runner import run_task  # noqa: E402
 
 
 st.set_page_config(page_title="Sentinel-QA", page_icon="🛡️", layout="wide", initial_sidebar_state="collapsed")
@@ -169,10 +170,12 @@ def start_active_run(kind: str, inputs: dict[str, object], run_label: str) -> No
         try:
             if kind == "pipeline":
                 holder["state"] = run_pipeline(on_event=events.put, guidance=channel, **inputs)
+            elif kind == "task":
+                holder["state"] = run_task(on_event=events.put, guidance=channel, **inputs)
             else:
                 run_exploration(on_event=events.put, guidance=channel, **inputs)
         except Exception:
-            # Both runners emit a user-safe failure event before raising.
+            # All runners emit a user-safe failure event before raising.
             pass
 
     thread = threading.Thread(target=worker, daemon=True)
@@ -181,7 +184,7 @@ def start_active_run(kind: str, inputs: dict[str, object], run_label: str) -> No
         run_active=True, run_kind=kind, run_label=run_label, run_worker=thread,
         run_events=events, run_holder=holder, run_channel=channel,
         run_logs=[], run_status="Starting…", run_url=str(inputs.get("start_url", "")),
-        run_shot=None, run_count=0,
+        run_shot=None, run_count=0, run_current_test=None, run_results=[],
     )
 
 
@@ -254,6 +257,40 @@ def save_uploaded_assets(asset_manager: AssetManager) -> None:
             st.session_state.pop("asset_error", None)
 
 
+def render_execution_panel() -> None:
+    """Live test-execution view: what is running now and what has finished."""
+    current = st.session_state.get("run_current_test")
+    results = st.session_state.get("run_results") or []
+    if not current and not results:
+        return
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Test execution</p>', unsafe_allow_html=True)
+    passed = sum(1 for item in results if item["Status"] == "passed")
+    finished = len(results)
+    st.markdown(
+        f'<p class="panel-subtitle">{finished} finished · {passed} passed · '
+        f'{finished - passed} failed</p>',
+        unsafe_allow_html=True,
+    )
+
+    if current:
+        total = current.get("total_steps") or 0
+        index = current.get("index") or 0
+        st.markdown(
+            f'<p class="status-label">Running now</p>'
+            f'<p class="status-value">▶ {current.get("title", "")}</p>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f'Step {index}/{total}: {current.get("step", "")}')
+        if total:
+            st.progress(min(1.0, index / total))
+
+    if results:
+        st.dataframe(results, use_container_width=True, hide_index=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def render_active_run() -> None:
     """Non-blocking live console: refreshes ~1×/s, chat stays interactive."""
     worker: threading.Thread = st.session_state["run_worker"]
@@ -272,6 +309,29 @@ def render_active_run() -> None:
             st.session_state["run_status"] = event["status"]
         if event.get("url"):
             st.session_state["run_url"] = event["url"]
+
+        event_type = event.get("type")
+        if event_type == "test_start":
+            st.session_state["run_current_test"] = {
+                "title": event.get("title", ""),
+                "test_id": event.get("test_id", ""),
+                "total_steps": event.get("total_steps", 0),
+                "step": "starting…",
+                "index": 0,
+            }
+        elif event_type == "test_step":
+            current = st.session_state.get("run_current_test") or {}
+            current.update(step=event.get("description", ""), index=event.get("index", 0),
+                           total_steps=event.get("total", current.get("total_steps", 0)))
+            st.session_state["run_current_test"] = current
+        elif event_type == "test_result":
+            st.session_state.setdefault("run_results", []).append({
+                "Test": event.get("title", ""),
+                "Status": event.get("result_status", ""),
+                "Seconds": round((event.get("duration_ms") or 0) / 1000, 1),
+                "Reason": (event.get("reason") or "")[:90],
+            })
+            st.session_state["run_current_test"] = None
         if event.get("type") == "log":
             logs = st.session_state["run_logs"]
             logs.append(event["message"])
@@ -316,6 +376,8 @@ def render_active_run() -> None:
     with activity_col:
         st.code("\n".join(st.session_state["run_logs"][-18:]) or "Waiting for activity…", language=None)
     st.markdown("</div>", unsafe_allow_html=True)
+
+    render_execution_panel()
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown('<p class="panel-title">Guide the agent</p><p class="panel-subtitle">Your messages are injected into the agent’s next planning step, and it may ask you questions when stuck.</p>', unsafe_allow_html=True)
@@ -494,13 +556,16 @@ with form_col:
     st.markdown('<p class="panel-title">New run</p><p class="panel-subtitle">Start with a URL, then add only the context the agents need.</p>', unsafe_allow_html=True)
     run_mode = st.radio(
         "Run mode",
-        ["Full QA pipeline", "Exploration only"],
+        ["Full QA pipeline", "Exploration only", "Browser task"],
         horizontal=True,
         help="The full pipeline analyses your docs, explores the app, designs and executes "
              "test cases in parallel, and produces a QA report. Exploration only runs the "
-             "original discovery agent.",
+             "original discovery agent. Browser task completes one real-world goal for you "
+             "(e.g. “order a biryani from the nearest restaurant”) in a visible Chrome "
+             "window, asking you in the chat for OTPs and payment confirmations.",
     )
     pipeline_mode = run_mode == "Full QA pipeline"
+    task_mode = run_mode == "Browser task"
     with st.form("exploration_form", clear_on_submit=False):
         website_url = st.text_input("Target URL", placeholder="https://app.example.com", help="The application entry point to explore.")
         credentials_col, steps_col = st.columns([1.5, 1])
@@ -510,7 +575,14 @@ with form_col:
                 password = st.text_input("Password", type="password")
         with steps_col:
             max_steps = st.number_input("Exploration depth", min_value=1, max_value=500, value=30, step=5, help="Maximum actions the agent may take.")
-        exploration_goal = st.text_area("What should the agent accomplish?", placeholder="Example: Open Candidates, find Nicole, update the candidate name to Max, save, then log out.", height=110)
+        exploration_goal = st.text_area(
+            "What should the agent accomplish?",
+            placeholder="Example: Log in with my email (ask me for the OTP), set the location to my area, "
+                        "and add a chicken biryani from the nearest restaurant to the cart."
+                        if task_mode else
+                        "Example: Open Candidates, find Nicole, update the candidate name to Max, save, then log out.",
+            height=110,
+        )
         application_context = st.text_area("Application context (optional)", placeholder="Important roles, rules, modules, or areas to prioritise and avoid.", height=80)
         if pipeline_mode:
             uploaded_docs = st.file_uploader(
@@ -537,6 +609,12 @@ with form_col:
                          "test that uses the real credentials (~15–20s faster per test). "
                          "Invalid-login tests still run fresh and logged out.",
                 )
+                show_browser = st.checkbox(
+                    "Show the browser while running tests",
+                    value=False,
+                    help="Runs each test in a visible Chrome window, like a Playwright headed "
+                         "run. Easier to watch; slightly slower.",
+                )
                 ask_when_stuck = st.checkbox(
                     "Agent may ask me when stuck (waits 120s)",
                     value=True,
@@ -544,7 +622,7 @@ with form_col:
                          "you in the chat and waits up to 120 seconds for your reply.",
                 )
         submitted = st.form_submit_button(
-            "Start QA pipeline" if pipeline_mode else "Start exploration",
+            "Start QA pipeline" if pipeline_mode else ("Start browser task" if task_mode else "Start exploration"),
             type="primary",
             use_container_width=True,
         )
@@ -670,9 +748,22 @@ if submitted:
             "preserve_session": bool(preserve_session),
             "max_concurrency": int(workers),
             "hitl_wait_seconds": 120 if ask_when_stuck else 0,
+            "show_browser": bool(show_browser),
         }
         start_active_run("pipeline", pipeline_inputs, "QA pipeline")
         st.rerun()
+    elif task_mode:
+        if not exploration_goal.strip():
+            st.error("Describe the task the agent should complete (e.g. what to order and from where).")
+        else:
+            task_inputs = {
+                "start_url": website_url.strip(),
+                "task": exploration_goal.strip(),
+                "max_steps": int(max_steps),
+                "hitl_wait_seconds": 180,
+            }
+            start_active_run("task", task_inputs, "Browser task")
+            st.rerun()
     else:
         run_inputs = {
             "start_url": website_url.strip(),

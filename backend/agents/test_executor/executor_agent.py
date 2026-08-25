@@ -17,7 +17,11 @@ from pathlib import Path
 from time import perf_counter
 
 from agents.healer import Healer
-from agents.test_designer.models import PASSWORD_PLACEHOLDER, USERNAME_PLACEHOLDER
+from agents.test_designer.models import (
+    PASSWORD_PLACEHOLDER,
+    USERNAME_PLACEHOLDER,
+    describe_step,
+)
 from observability.tracing import NoopObservability
 
 
@@ -89,15 +93,20 @@ def create_login_session(start_url: str, username: str, password: str, path,
 class ExecutorAgent:
     """Replay one test case in an isolated browser and return a TestResult dict."""
 
-    def __init__(self, observability=None, healer: Healer | None = None, headless: bool | None = None):
+    def __init__(self, observability=None, healer: Healer | None = None,
+                 headless: bool | None = None, on_event=None):
         self.observability = observability or NoopObservability()
         self.healer = healer or Healer(self.observability)
         if headless is None:
             headless = os.getenv("QA_EXECUTOR_HEADLESS", "true").strip().casefold() != "false"
         self.headless = headless
+        # Streams live execution progress (current test, current step, verdict)
+        # to the UI so a run is watchable, not a black box.
+        self.on_event = on_event or (lambda event: None)
 
     def run(self, test_case: dict, start_url: str, username: str = "", password: str = "",
-            run_id: str = "run", session_state_path: str | None = None) -> dict:
+            run_id: str = "run", session_state_path: str | None = None,
+            headless: bool | None = None) -> dict:
         # Imported lazily so this module stays importable without Playwright
         # and each worker thread builds its own browser stack.
         from browser import BrowserController
@@ -139,12 +148,20 @@ class ExecutorAgent:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
+        self.on_event({
+            "type": "test_start",
+            "test_id": result["test_id"],
+            "title": result["title"],
+            "total_steps": len(test_case.get("steps", [])),
+            "status": f"Running test: {result['title']}",
+        })
         browser = BrowserController()
         with self.observability.span(
             "Test Executor", input={"test_id": result["test_id"], "title": result["title"]}
         ) as span:
             try:
-                browser.start(observability=self.observability, headless=self.headless,
+                browser.start(observability=self.observability,
+                              headless=self.headless if headless is None else headless,
                               storage_state=storage_state)
                 browser.open(self._absolute_url(start_url, ""))
                 self._run_steps(browser, test_case, start_url, username, password, result)
@@ -162,6 +179,16 @@ class ExecutorAgent:
                     logger.warning("Executor could not close the browser cleanly", exc_info=True)
             result["duration_ms"] = round((perf_counter() - started_at) * 1000, 1)
             span.update(output={"status": result["status"], "duration_ms": result["duration_ms"]})
+        self.on_event({
+            "type": "test_result",
+            "test_id": result["test_id"],
+            "title": result["title"],
+            "result_status": result["status"],
+            "reason": result.get("failure_reason"),
+            "duration_ms": result["duration_ms"],
+            "screenshot_path": (result.get("evidence") or {}).get("screenshot"),
+            "status": f"{result['status'].upper()}: {result['title']}",
+        })
         return result
 
     # ------------------------------------------------------------------
@@ -180,8 +207,18 @@ class ExecutorAgent:
             for position, raw_step in enumerate(steps):
                 index = position + 1
                 step = self._substitute(raw_step, username, password)
+                # Describe the RAW step: the substituted one holds credentials.
+                self.on_event({
+                    "type": "test_step",
+                    "test_id": result["test_id"],
+                    "index": index,
+                    "total": len(steps),
+                    "description": describe_step(raw_step),
+                    "status": f"Step {index}/{len(steps)}: {describe_step(raw_step)}",
+                })
                 url_before_step = browser.current_url() if browser.page else None
                 error = self._execute_step(browser, step, start_url)
+                self._emit_live_frame(browser, result["test_id"])
                 if error is not None:
                     verdict = self.healer.heal(
                         test_case.get("title", ""), step, error, self._page_snapshot(browser)
@@ -445,6 +482,21 @@ class ExecutorAgent:
     # ------------------------------------------------------------------
     # Evidence and healing context
     # ------------------------------------------------------------------
+
+    def _emit_live_frame(self, browser, test_id: str) -> None:
+        """Publish the current browser view so the UI can show execution live."""
+        try:
+            from runner import SCREENSHOT_PATH
+
+            SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Per-worker temp name keeps parallel executors from clobbering
+            # each other mid-write; the rename itself is atomic.
+            tmp_path = SCREENSHOT_PATH.with_name(f"exec-{test_id}.tmp.png")
+            browser.screenshot(str(tmp_path))
+            os.replace(tmp_path, SCREENSHOT_PATH)
+            self.on_event({"type": "test_frame", "screenshot_path": str(SCREENSHOT_PATH)})
+        except Exception:
+            logger.debug("Could not publish a live execution frame", exc_info=True)
 
     @staticmethod
     def _page_snapshot(browser) -> dict:
