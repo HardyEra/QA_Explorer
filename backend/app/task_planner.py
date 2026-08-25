@@ -1,25 +1,31 @@
-"""Gemini-backed next-action planner for the browser task agent.
+"""Next-action planners for the browser task agent.
 
 One call per step: the agent supplies a text description of the page (and,
-only when it decides the DOM is not enough, a viewport screenshot), and the
-planner returns exactly one next action as validated JSON.  A failed or
-unparseable response returns ``None``; the agent owns what happens then.
+only when the Vision Analyst decided the DOM is not enough, a viewport
+screenshot), and the planner returns exactly one next action as validated
+JSON.  A failed or unparseable response returns ``None``; the agent owns what
+happens then.
+
+Two interchangeable backends share the decision contract: Azure OpenAI
+(preferred when ``AZURE_OPENAI_API_KEY`` is configured) and Gemini as the
+fallback.  ``create_task_planner`` picks one; the Vision Analyst stays on
+Gemini either way.
+
+Diagnostics go to Langfuse only: each call is a "TaskPlanner" generation, and
+anomalies (missing key, invalid decisions, request failures) are events.
 """
 
 from __future__ import annotations
 
+import base64
 import json
-import logging
 import os
 from dataclasses import dataclass
-from time import perf_counter
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from observability.tracing import NoopObservability
 
-
-logger = logging.getLogger(__name__)
 
 ACTION_TYPES = frozenset({
     "click", "click_text", "fill", "enter_otp", "click_at", "press_key",
@@ -81,6 +87,21 @@ class TaskDecision:
         return self.action_type
 
 
+def _parse_decision(raw: str, observability) -> TaskDecision | None:
+    """Validate one raw JSON decision against the shared contract."""
+    try:
+        payload = _DecisionPayload.model_validate(json.loads(raw))
+    except (json.JSONDecodeError, ValidationError, ValueError):
+        return None
+    if payload.action_type not in ACTION_TYPES:
+        observability.event(
+            name="planner_unknown_action",
+            metadata={"action_type": payload.action_type}, level="WARNING",
+        )
+        return None
+    return TaskDecision(**payload.model_dump())
+
+
 class GeminiTaskPlanner:
     """Decide the single next browser action with Gemini."""
 
@@ -99,12 +120,18 @@ class GeminiTaskPlanner:
     def decide(self, prompt: str, screenshot_jpeg: bytes | None = None) -> TaskDecision | None:
         """Return the validated next action, or ``None`` after retries fail."""
         if not self.api_key:
-            logger.warning("GEMINI_API_KEY is not configured; task planner unavailable")
+            self.observability.event(
+                name="planner_unavailable",
+                metadata={"reason": "GEMINI_API_KEY is not configured"}, level="ERROR",
+            )
             return None
         try:
             client, types = self._create_client()
         except RuntimeError as exc:
-            logger.error("Task planner unavailable: %s", exc)
+            self.observability.event(
+                name="planner_unavailable",
+                metadata={"reason": str(exc)}, level="ERROR",
+            )
             return None
 
         with self.observability.generation(
@@ -119,7 +146,11 @@ class GeminiTaskPlanner:
                 return None
             decision = self._parse(raw)
             if decision is None:
-                logger.warning("Task planner returned an invalid decision; retrying once")
+                self.observability.event(
+                    name="planner_invalid_decision",
+                    metadata={"raw": raw[:500], "action": "retrying once with a repair prompt"},
+                    level="WARNING",
+                )
                 raw, retry_usage = self._generate(
                     client, types, prompt + "\n\n" + REPAIR_PROMPT, screenshot_jpeg
                 )
@@ -128,9 +159,8 @@ class GeminiTaskPlanner:
             generation.update(
                 output={"decision": decision.__dict__ if decision else None},
                 usage_details=usage or None,
+                status_message=None if decision else "no valid decision after repair retry",
             )
-        if decision is None:
-            logger.error("Task planner could not produce a valid decision")
         return decision
 
     def _create_client(self):
@@ -152,7 +182,6 @@ class GeminiTaskPlanner:
         contents: list = [prompt]
         if screenshot_jpeg:
             contents.append(types.Part.from_bytes(data=screenshot_jpeg, mime_type="image/jpeg"))
-        started_at = perf_counter()
         try:
             response = client.models.generate_content(
                 model=self.model,
@@ -166,25 +195,13 @@ class GeminiTaskPlanner:
                 ),
             )
         except Exception as exc:
-            logger.error("Task planner request failed: %s", exc)
             self.observability.record_exception(exc, context={"active_action": "TaskPlanner"})
             return None, {}
-        finally:
-            logger.info("Task planner latency: %.0f ms", (perf_counter() - started_at) * 1000)
         usage = self._token_usage(getattr(response, "usage_metadata", None))
         return response.text or "", usage
 
-    @staticmethod
-    def _parse(raw: str) -> TaskDecision | None:
-        try:
-            payload = _DecisionPayload.model_validate(json.loads(raw))
-        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            logger.warning("Task planner JSON validation failed: %s", exc)
-            return None
-        if payload.action_type not in ACTION_TYPES:
-            logger.warning("Task planner chose unknown action_type: %s", payload.action_type)
-            return None
-        return TaskDecision(**payload.model_dump())
+    def _parse(self, raw: str) -> TaskDecision | None:
+        return _parse_decision(raw, self.observability)
 
     @staticmethod
     def _token_usage(usage) -> dict[str, int]:
@@ -204,3 +221,127 @@ class GeminiTaskPlanner:
     @staticmethod
     def _add_usage(first: dict[str, int], second: dict[str, int]) -> dict[str, int]:
         return {key: first.get(key, 0) + second.get(key, 0) for key in first.keys() | second.keys()}
+
+
+class AzureTaskPlanner:
+    """Decide the single next browser action with an Azure OpenAI deployment.
+
+    Talks to the Responses API of one deployed model.  The endpoint and
+    deployment default to the project's known deployment so only
+    ``AZURE_OPENAI_API_KEY`` has to live in ``.env``.
+    """
+
+    def __init__(self, api_key: str | None = None, observability=None):
+        self.api_key = api_key if api_key is not None else os.getenv("AZURE_OPENAI_API_KEY", "")
+        self.endpoint = os.getenv(
+            "AZURE_OPENAI_ENDPOINT", "https://abhishek-bahukhandi.openai.azure.com"
+        ).rstrip("/")
+        self.deployment = os.getenv("AZURE_OPENAI_TASK_DEPLOYMENT", "gpt-5.6-sol")
+        self.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
+        self.observability = observability or NoopObservability()
+
+    @property
+    def available(self) -> bool:
+        return bool(self.api_key)
+
+    def decide(self, prompt: str, screenshot_jpeg: bytes | None = None) -> TaskDecision | None:
+        """Return the validated next action, or ``None`` after retries fail."""
+        if not self.api_key:
+            self.observability.event(
+                name="planner_unavailable",
+                metadata={"reason": "AZURE_OPENAI_API_KEY is not configured"}, level="ERROR",
+            )
+            return None
+        try:
+            client = self._create_client()
+        except RuntimeError as exc:
+            self.observability.event(
+                name="planner_unavailable", metadata={"reason": str(exc)}, level="ERROR",
+            )
+            return None
+
+        with self.observability.generation(
+            "TaskPlanner",
+            model=self.deployment,
+            temperature=None,
+            input={"prompt": prompt, "screenshot_attached": screenshot_jpeg is not None},
+            metadata={"component": "task_planner", "provider": "azure_openai"},
+        ) as generation:
+            raw, usage = self._generate(client, prompt, screenshot_jpeg)
+            if raw is None:
+                return None
+            decision = _parse_decision(raw, self.observability)
+            if decision is None:
+                self.observability.event(
+                    name="planner_invalid_decision",
+                    metadata={"raw": raw[:500], "action": "retrying once with a repair prompt"},
+                    level="WARNING",
+                )
+                raw, retry_usage = self._generate(
+                    client, prompt + "\n\n" + REPAIR_PROMPT, screenshot_jpeg
+                )
+                usage = GeminiTaskPlanner._add_usage(usage, retry_usage)
+                decision = _parse_decision(raw, self.observability) if raw is not None else None
+            generation.update(
+                output={"decision": decision.__dict__ if decision else None},
+                usage_details=usage or None,
+                status_message=None if decision else "no valid decision after repair retry",
+            )
+        return decision
+
+    def _create_client(self):
+        try:
+            from openai import AzureOpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "the openai package is required for the Azure task planner"
+            ) from exc
+        return AzureOpenAI(
+            api_key=self.api_key,
+            azure_endpoint=self.endpoint,
+            api_version=self.api_version,
+            timeout=60.0,
+        )
+
+    def _generate(self, client, prompt: str,
+                  screenshot_jpeg: bytes | None) -> tuple[str | None, dict[str, int]]:
+        content: list[dict] = [{"type": "input_text", "text": prompt}]
+        if screenshot_jpeg:
+            encoded = base64.b64encode(screenshot_jpeg).decode("ascii")
+            content.append({
+                "type": "input_image",
+                "image_url": f"data:image/jpeg;base64,{encoded}",
+            })
+        try:
+            response = client.responses.create(
+                model=self.deployment,
+                input=[{"role": "user", "content": content}],
+                text={"format": {
+                    "type": "json_schema",
+                    "name": "task_decision",
+                    "schema": _DecisionPayload.model_json_schema(),
+                    "strict": True,
+                }},
+            )
+        except Exception as exc:
+            self.observability.record_exception(exc, context={"active_action": "TaskPlanner"})
+            return None, {}
+        return response.output_text or "", self._token_usage(getattr(response, "usage", None))
+
+    @staticmethod
+    def _token_usage(usage) -> dict[str, int]:
+        if usage is None:
+            return {}
+        return {
+            key: value
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+            if isinstance((value := getattr(usage, key, None)), int)
+        }
+
+
+def create_task_planner(observability=None):
+    """Azure OpenAI when its key is configured; Gemini otherwise."""
+    azure = AzureTaskPlanner(observability=observability)
+    if azure.available:
+        return azure
+    return GeminiTaskPlanner(observability=observability)

@@ -202,6 +202,20 @@ class LangfuseObservability:
             # outer boundary in case a future implementation changes it.
             logger.exception("Failed to send exception to Langfuse")
 
+    def event(
+        self, name: str, *, input: Any = None, output: Any = None,
+        metadata: dict[str, Any] | None = None, level: str | None = None,
+        status_message: str | None = None,
+    ) -> None:
+        """Point-in-time log line, attached to the current trace context."""
+        try:
+            self._client.create_event(
+                name=name, input=input, output=output, metadata=metadata,
+                level=level, status_message=status_message,
+            )
+        except Exception:
+            logger.exception("Failed to send Langfuse event %s", name)
+
     def score_current_trace(
         self, name: str, value: float | str, *, data_type: str = "NUMERIC",
         comment: str | None = None, metadata: dict[str, Any] | None = None,
