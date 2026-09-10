@@ -174,9 +174,9 @@ def test_designer_grounds_expectations_and_keeps_valid_blocked_entries():
 
     cases, blocked = designer.design("auth", requirements, app_map, "https://shop.test")
 
-    # "Sign In" is in the app map; "Notification sent" was invented and dropped;
-    # the observed URL survives while the invented "slide-1" URL is dropped.
-    assert [e["value"] for e in cases[0]["expected"]] == ["Sign In", "shop.test/login"]
+    # Unknown outcomes remain assertions and are flagged for review, never silently deleted.
+    assert [e["value"] for e in cases[0]["expected"]] == ["Sign In", "Notification sent", "shop.test/login", "slide-1"]
+    assert cases[0]["unverified"]
     assert [entry["requirement_id"] for entry in blocked] == ["prd-R2"]
 
 
@@ -281,7 +281,7 @@ def test_verifier_corrects_near_misses_and_flags_inventions():
     assert steps[2]["target"] == "Sign in"
     assert steps[3]["target"] == "Onboarded Vendors 35"
     assert steps[4]["target"] == "Teleport to Mars"          # kept, but flagged
-    assert [e["value"] for e in verified[0]["expected"]] == ["dashboard"]
+    assert [e["value"] for e in verified[0]["expected"]] == ["dashboard", "Nonexistent Widget"]
     assert verified[0]["unverified"]
     assert {p["target"] for p in problems} == {"Teleport to Mars", "Nonexistent Widget"}
 

@@ -12,14 +12,30 @@ import re
 from typing import Any
 
 
-STEP_TYPES = {"navigate", "click", "fill", "upload", "select"}
-EXPECTATION_TYPES = {"url_contains", "text_visible", "element_visible"}
+STEP_TYPES = {"navigate", "click", "fill", "upload", "select", "check", "assert"}
+EXPECTATION_TYPES = {"url_contains", "text_visible", "element_visible", "field_value", "checked"}
 VALID_PRIORITIES = ("critical", "high", "medium", "low")
 
 # Values may reference credentials symbolically; the Executor substitutes the
 # real values at run time so secrets never live inside generated test cases.
 USERNAME_PLACEHOLDER = "{username}"
 PASSWORD_PLACEHOLDER = "{password}"
+
+
+def normalise_expectation(raw):
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("type", "")).strip().casefold()
+    value = str(raw.get("value", "")).strip()
+    if kind not in EXPECTATION_TYPES or (not value and kind != "field_value"):
+        return None
+    result = {"type": kind, "value": value}
+    if kind in ("field_value", "checked"):
+        target = str(raw.get("target", "")).strip()
+        if not target or (kind == "checked" and value not in ("true", "false")):
+            return None
+        result["target"] = target
+    return result
 
 
 def normalise_case(raw: Any, fallback_id: str) -> dict[str, Any] | None:
@@ -42,9 +58,19 @@ def normalise_case(raw: Any, fallback_id: str) -> dict[str, Any] | None:
         # "Global Search... (type=text)" — but the annotation is not UI text.
         target = re.sub(r"\s*\(type=[a-z]+\)$", "", target)
         target = re.sub(r"\s*\[(dropdown|checkbox|radio|file upload|menu item)\]$", "", target)
-        if step_type in {"click", "fill", "select"} and not target:
+        if step_type in {"click", "fill", "select", "check"} and not target:
             continue
         normalised = {"type": step_type, "target": target}
+        if step_type == "assert":
+            expectation = normalise_expectation(step.get("expectation"))
+            if expectation is None:
+                return None
+            normalised["expectation"] = expectation
+        if step_type == "check":
+            checked = str(step.get("value", "true")).casefold()
+            if checked not in ("true", "false"):
+                return None
+            normalised["value"] = checked
         if step_type == "fill":
             normalised["value"] = str(step.get("value") or "")
         if step_type == "select":
@@ -64,10 +90,9 @@ def normalise_case(raw: Any, fallback_id: str) -> dict[str, Any] | None:
     for expectation in raw.get("expected") or []:
         if not isinstance(expectation, dict):
             continue
-        expectation_type = str(expectation.get("type") or "").strip().casefold()
-        value = str(expectation.get("value") or "").strip()
-        if expectation_type in EXPECTATION_TYPES and value:
-            expected.append({"type": expectation_type, "value": value})
+        normalised = normalise_expectation(expectation)
+        if normalised:
+            expected.append(normalised)
     if not expected:
         return None
 
@@ -104,6 +129,10 @@ def describe_step(step: dict[str, Any]) -> str:
         return f"enter {described_value} into '{target}'"
     if step_type == "click":
         return f"click '{target}'"
+    if step_type == "check":
+        return f"set '{target}' to {step.get('value', 'true')}"
+    if step_type == "assert":
+        return "verify " + describe_expectation(step.get("expectation", {}))
     if step_type == "upload":
         asset = str(step.get("value") or "a test file")
         suffix = f" via '{target}'" if target else ""
@@ -123,6 +152,8 @@ def describe_expectation(expectation: dict[str, Any]) -> str:
         return f"the text '{value}' is visible on the page"
     if kind == "element_visible":
         return f"a control labeled '{value}' is visible"
+    if kind in ("field_value", "checked"):
+        return f"'{expectation.get('target', '')}' has {kind} '{value}'"
     return f"{kind} '{value}'"
 
 

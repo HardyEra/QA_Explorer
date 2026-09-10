@@ -77,6 +77,15 @@ Allowed step types (the runner is deterministic, no other types exist):
 - {{"type": "upload", "target": "<visible label of the upload control, or empty>",
    "value": "<asset name from the list below>"}}
 - {{"type": "select", "target": "<label of the dropdown>", "value": "<visible text of the option to choose>"}}
+- {{"type": "check", "target": "<unique checkbox id or label>", "value": "true"}}
+- {{"type": "assert", "expectation": {{"type": "field_value", "target": "<unique input id>", "value": "<expected value>"}}}}
+CHECKPOINT RULE: use assert steps between wizard pages and before submitting.
+Verify autofilled contact values and checkbox state. Use unique field ids where
+labels repeat. Include prerequisite business setup inside the test; do not rely
+on another test creating a client or vendor. Use user-provided valid test IDs
+and listed assets; do not invent official identities or documents. For record
+creation, navigate to the resulting list/detail and verify the specific record;
+a reset form or generic Submit button is not evidence of creation.
 DROPDOWN RULE: a control marked [dropdown] in the map, or a field shown as
 (type=select), is NOT typeable — use a "select" step for it, never "fill".
 Stored test assets available for upload steps: {assets_note}
@@ -89,6 +98,9 @@ input type. Use the exact form-field names from the application map when
 present. For unlabeled login fields, use the target "email" (or "username")
 and "password" — the runner resolves those by input type.
 
+Allowed expectation types (also valid in assert checkpoints):
+- {{"type": "field_value", "target": "<unique input id>", "value": "<expected value>"}}
+- {{"type": "checked", "target": "<unique checkbox id>", "value": "true"}}
 Allowed expectation types (checked after the final step):
 - {{"type": "text_visible", "value": "<text expected on the page>"}}
 - {{"type": "element_visible", "value": "<label of an expected control>"}}
@@ -313,44 +325,18 @@ class TestDesigner:
 
     @staticmethod
     def _ground_case(case: dict, corpus: str, start_url: str) -> dict:
-        """Drop expectations nothing observed or documented supports.
-
-        This includes URLs: models invent URL schemes ("slide-1") that no
-        observed page ever had, producing false failures.
-        """
+        """Retain outcome assertions; unknown map coverage is not disproof."""
         domain = (urlparse(start_url).netloc or start_url).casefold()
-        grounded = []
-        for expectation in case.get("expected", []):
-            value = expectation["value"].casefold()
-            if expectation["type"] == "url_contains":
-                if value in corpus or domain in value or value in start_url.casefold():
-                    grounded.append(expectation)
-                else:
-                    logger.info(
-                        "Dropped ungrounded URL expectation %r from case %s",
-                        expectation["value"], case.get("id"),
-                    )
-                continue
-            if value in corpus:
-                grounded.append(expectation)
-            else:
-                logger.info(
-                    "Dropped ungrounded expectation %r from case %s",
-                    expectation["value"], case.get("id"),
-                )
-        domain = (urlparse(start_url).netloc or start_url).casefold()
-        functional = [item for item in grounded if item["type"] != "url_contains"]
+        expected = list(case.get("expected", []))
+        functional = any(item["type"] != "url_contains" for item in expected)
         if functional:
-            # "Still on the site" adds nothing once a real check exists; keep
-            # only URL checks that name a specific path.
-            grounded = functional + [
-                item for item in grounded
-                if item["type"] == "url_contains" and item["value"].casefold().strip("/") != domain
-            ]
-        if not grounded:
-            # Last resort when nothing about the destination was ever observed.
-            grounded = [{"type": "url_contains", "value": domain}]
-        return {**case, "expected": grounded}
+            expected = [item for item in expected if not (
+                item["type"] == "url_contains" and item["value"].casefold().strip("/") == domain
+            )]
+        unseen = [f"Outcome not yet observed in the map: {item['value']}"
+                  for item in expected if item["type"] not in ("field_value", "checked")
+                  and item["value"].casefold() not in corpus]
+        return {**case, "expected": expected, "unverified": list(case.get("unverified", [])) + unseen}
 
     @staticmethod
     def _fallback(feature: str, requirements: list[dict], app_map: dict, start_url: str) -> list[dict]:

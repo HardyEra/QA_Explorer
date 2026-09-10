@@ -57,6 +57,10 @@ def _usage_details(response):
     if not usage:
         return None
     details = {}
+    if getattr(usage, "input_tokens", None) is not None:
+        details["input_tokens"] = usage.input_tokens
+    if getattr(usage, "output_tokens", None) is not None:
+        details["output_tokens"] = usage.output_tokens
     if getattr(usage, "prompt_tokens", None) is not None:
         details["input_tokens"] = usage.prompt_tokens
     if getattr(usage, "completion_tokens", None) is not None:
@@ -67,9 +71,21 @@ def _usage_details(response):
 class JsonModelClient:
     """Call the shared planning model and return one parsed JSON object."""
 
-    def __init__(self, observability=None, model: str = AGENT_MODEL):
+    def __init__(self, observability=None, model: str | None = None):
         self.observability = observability or NoopObservability()
-        self.model = model
+        self.provider = os.getenv("QA_MODEL_PROVIDER", "azure" if os.getenv("AZURE_OPENAI_API_KEY") else "groq")
+        if self.provider == "azure":
+            from openai import AzureOpenAI
+            self.model = model or os.getenv("AZURE_OPENAI_QA_DEPLOYMENT", os.getenv("AZURE_OPENAI_TASK_DEPLOYMENT", "gpt-5.6-sol"))
+            key = os.getenv("AZURE_OPENAI_API_KEY")
+            self.client = AzureOpenAI(
+                api_key=key,
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "https://abhishek-bahukhandi.openai.azure.com"),
+                api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
+                timeout=60, max_retries=0,
+            ) if key else None
+            return
+        self.model = model or AGENT_MODEL
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             logger.warning("GROQ_API_KEY is not configured; agents will use deterministic fallbacks")
@@ -94,17 +110,23 @@ class JsonModelClient:
             model=self.model,
             temperature=AGENT_TEMPERATURE,
             input=prompt,
-            metadata={"provider": "groq"},
+            metadata={"provider": self.provider},
         ) as generation:
             response = None
             for attempt in range(len(RETRY_DELAYS_S) + 1):
                 try:
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=AGENT_TEMPERATURE,
-                        response_format={"type": "json_object"},
-                    )
+                    if self.provider == "azure":
+                        response = self.client.responses.create(
+                            model=self.model, input=prompt,
+                            text={"format": {"type": "json_object"}},
+                        )
+                    else:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=AGENT_TEMPERATURE,
+                            response_format={"type": "json_object"},
+                        )
                     break
                 except Exception as exc:
                     if attempt < len(RETRY_DELAYS_S) and _is_retryable(str(exc)):
@@ -121,7 +143,7 @@ class JsonModelClient:
                     logger.warning("%s: model request failed (%s); using fallback", name, exc)
                     return None
 
-            content = (response.choices[0].message.content or "").strip()
+            content = (response.output_text if self.provider == "azure" else response.choices[0].message.content or "").strip()
             generation.update(output=content, usage_details=_usage_details(response))
 
         try:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -218,11 +219,23 @@ class ExecutorAgent:
                 })
                 url_before_step = browser.current_url() if browser.page else None
                 error = self._execute_step(browser, step, start_url)
+                result.setdefault("step_results", []).append({
+                    "index": index, "type": raw_step.get("type"),
+                    "target": raw_step.get("target", ""), "success": error is None,
+                    "error": error,
+                })
                 self._emit_live_frame(browser, result["test_id"])
                 if error is not None:
-                    verdict = self.healer.heal(
-                        test_case.get("title", ""), step, error, self._page_snapshot(browser)
+                    committing_click = step.get("type") == "click" and re.search(
+                        r"\b(submit|save|create|confirm|finish|pay|place order)\b",
+                        step.get("target", ""), re.IGNORECASE,
                     )
+                    if committing_click or step.get("type") == "assert" or "mismatch" in error.casefold() or "Ambiguous" in error:
+                        verdict = {"decision": "bug", "reason": error}
+                    else:
+                        verdict = self.healer.heal(
+                            test_case.get("title", ""), raw_step, error, self._page_snapshot(browser)
+                        )
                     if verdict["decision"] == "retry":
                         revised = self._substitute(verdict["revised_step"], username, password)
                         if self._execute_step(browser, revised, start_url) is None:
@@ -232,6 +245,7 @@ class ExecutorAgent:
                                 index, result["test_id"], step.get("target"), revised.get("target"),
                             )
                             error = None
+                            result["step_results"][-1].update(success=True, healed=True, error=None)
                     if error is not None:
                         result["status"] = "failed"
                         # Record the raw step, not the substituted one: the
@@ -285,7 +299,20 @@ class ExecutorAgent:
             if step_type == "fill":
                 if browser.fill_input(target, step.get("value", "")):
                     return None
-                return f"no fillable input matched {target!r}"
+                return getattr(browser, "last_control_error", "") or f"could not fill {target!r}"
+            if step_type == "check":
+                ok = browser.set_checkbox(target, step.get("value", "true") == "true")
+                return None if ok else browser.last_control_error
+            if step_type == "assert":
+                from browser_controls import check_expectation
+                from time import monotonic
+                deadline = monotonic() + VALIDATION_WINDOW_MS / 1000
+                while True:
+                    if check_expectation(browser.page, step["expectation"]):
+                        return None
+                    if monotonic() >= deadline:
+                        return "Checkpoint assertion failed"
+                    browser.page.wait_for_timeout(200)
             if step_type == "click":
                 return self._click_by_label(browser, target)
             if step_type == "select":
@@ -294,108 +321,27 @@ class ExecutorAgent:
                 return self._upload_asset(browser, target, step.get("value", ""))
             return f"unsupported step type {step_type!r}"
         except Exception as exc:
-            return f"{type(exc).__name__}: {exc}"
+            return f"{type(exc).__name__}: step could not establish its requested state"
 
     @staticmethod
     def _select_option(browser, target: str, option: str) -> str | None:
-        """Choose an option in a native <select> or a custom dropdown."""
-        page = browser.page
-        # Native selects first: select_option works without opening the menu.
-        for locate in (
-            lambda: page.get_by_label(target),
-            lambda: page.locator(f'select[name="{target}" i]'),
-            lambda: page.locator(f'select[aria-label="{target}" i]'),
-        ):
-            try:
-                locate().first.select_option(label=option, timeout=1_500)
-                browser.wait_for_page_ready()
-                return None
-            except Exception:
-                continue
-        # Custom dropdowns (React selects, comboboxes): open, then click the option.
-        open_error = ExecutorAgent._click_by_label(browser, target)
-        if open_error is not None:
-            return f"could not open the {target!r} dropdown: {open_error}"
-        for locate in (
-            lambda: page.get_by_role("option", name=option),
-            lambda: page.get_by_text(option, exact=True),
-            lambda: page.get_by_text(option),
-        ):
-            try:
-                locator = locate().first
-                locator.wait_for(state="visible", timeout=2_000)
-                locator.click(timeout=STEP_TIMEOUT_MS)
-                browser.wait_for_page_ready()
-                return None
-            except Exception:
-                continue
-        return f"opened {target!r} but no option matched {option!r}"
+        return None if browser.select_control(target, option) else browser.last_control_error
 
     @staticmethod
     def _upload_asset(browser, target: str, asset_name: str) -> str | None:
-        """Attach a stored test asset; bypasses the OS file dialog entirely."""
         from asset_manager import AssetManager
-
         manager = AssetManager()
-        asset_path = None
-        if asset_name:
-            asset_path = manager.get_asset_path(asset_name)
+        assets = manager.list_assets()
+        asset_path = assets.get(asset_name) if asset_name else (
+            next(iter(assets.values())) if len(assets) == 1 else None
+        )
         if asset_path is None:
-            assets = manager.list_assets()
-            asset_path = next(iter(assets.values()), None)
-        if asset_path is None:
-            return (
-                f"no stored test asset available for {asset_name or 'upload'!r} — "
-                "add one in the Test assets panel"
-            )
-
-        # Native file inputs first: set_input_files works even when the input
-        # is visually hidden behind a styled button.
-        if browser.has_file_inputs() and browser.upload_file_inputs(asset_path):
-            browser.wait_for_page_ready()
-            return None
-        # Custom upload buttons open a file chooser; intercept it.
-        if target:
-            try:
-                with browser.page.expect_file_chooser(timeout=STEP_TIMEOUT_MS) as chooser_info:
-                    browser.page.get_by_text(target).first.click(timeout=STEP_TIMEOUT_MS)
-                chooser_info.value.set_files(str(asset_path))
-                browser.wait_for_page_ready()
-                return None
-            except Exception as exc:
-                return f"could not upload via {target!r}: {type(exc).__name__}"
-        return "no file input or upload control found on the page"
+            return f"Requested test asset {asset_name!r} is unavailable or ambiguous"
+        return None if browser.upload_target(target, asset_path) else browser.last_control_error
 
     @staticmethod
     def _click_by_label(browser, label: str) -> str | None:
-        """Click a control by its visible label using resilient strategies."""
-        page = browser.page
-        strategies = (
-            lambda: page.get_by_role("button", name=label, exact=True),
-            lambda: page.get_by_role("link", name=label, exact=True),
-            lambda: page.get_by_role("button", name=label),
-            lambda: page.get_by_role("link", name=label),
-            lambda: page.get_by_text(label, exact=True),
-            lambda: page.get_by_text(label),
-            # Accessible names: icon controls often carry their label only in
-            # aria-label (e.g. "View Onboarded Vendors details"), which
-            # visible-text matching can never find.
-            lambda: page.get_by_label(label, exact=True),
-            lambda: page.get_by_label(label),
-            lambda: page.locator(f'[aria-label="{label}" i]'),
-            lambda: page.locator(f'[title="{label}" i]'),
-        )
-        last_error = None
-        for strategy in strategies:
-            try:
-                locator = strategy().first
-                locator.wait_for(state="visible", timeout=STEP_TIMEOUT_MS // len(strategies))
-                locator.click(timeout=STEP_TIMEOUT_MS)
-                browser.wait_for_page_ready()
-                return None
-            except Exception as exc:
-                last_error = exc
-        return f"no clickable control matched {label!r} ({type(last_error).__name__})"
+        return None if browser.click_text(label) else browser.last_control_error
 
     @staticmethod
     def _substitute(step: dict, username: str, password: str) -> dict:
@@ -429,8 +375,13 @@ class ExecutorAgent:
         """
         from time import monotonic
 
+        if not test_case.get("expected"):
+            result["status"] = "failed"
+            result["failure_reason"] = "No outcome assertions were supplied; completion is unverified"
+            result["expectations"] = []
+            return
         checks = [
-            {"type": expectation["type"], "value": expectation["value"], "passed": False}
+            {**expectation, "passed": False}
             for expectation in test_case.get("expected", [])
         ]
         deadline = monotonic() + VALIDATION_WINDOW_MS / 1000
@@ -456,28 +407,8 @@ class ExecutorAgent:
 
     @staticmethod
     def _check(browser, expectation: dict) -> bool:
-        # Each probe is quick; the polling loop in _validate provides patience.
-        value = expectation["value"]
-        try:
-            if expectation["type"] == "url_contains":
-                return value.casefold() in browser.current_url().casefold()
-            if expectation["type"] == "text_visible":
-                body = browser.page.locator("body").inner_text(timeout=1_000)
-                if value.casefold() in body.casefold():
-                    return True
-                # Input placeholders (e.g. "Global Search...") are real,
-                # user-visible text but never part of the body's inner text.
-                return browser.page.get_by_placeholder(value).first.is_visible(timeout=500)
-            if expectation["type"] == "element_visible":
-                if browser.page.get_by_text(value).first.is_visible(timeout=1_000):
-                    return True
-                if browser.page.get_by_placeholder(value).first.is_visible(timeout=500):
-                    return True
-                # aria-labelled controls have no visible text to match.
-                return browser.page.get_by_label(value).first.is_visible(timeout=500)
-        except Exception:
-            return False
-        return False
+        from browser_controls import check_expectation
+        return check_expectation(browser.page, expectation)
 
     # ------------------------------------------------------------------
     # Evidence and healing context
@@ -536,5 +467,7 @@ class ExecutorAgent:
             browser.screenshot(str(screenshot_path))
             result["evidence"]["screenshot"] = str(screenshot_path)
             result["evidence"]["final_url"] = browser.current_url()
+            from browser_controls import page_evidence
+            result["evidence"]["page_state"] = page_evidence(browser.page)
         except Exception:
             logger.debug("Could not capture evidence for %s", result["test_id"], exc_info=True)

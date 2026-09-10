@@ -30,13 +30,14 @@ from observability.tracing import NoopObservability
 ACTION_TYPES = frozenset({
     "click", "click_text", "fill", "enter_otp", "click_at", "press_key",
     "scroll", "navigate", "ask_human", "wait", "look", "done", "fail",
+    "select", "check", "upload", "verify",
 })
 
 REPAIR_PROMPT = """Your previous response could not be parsed or did not match the
 required schema. Return a replacement decision now: one JSON object conforming
 exactly to the response schema, with action_type set to one of: click, click_text,
 fill, enter_otp, click_at, press_key, scroll, navigate, ask_human, wait, look,
-done, fail. No markdown or commentary."""
+select, check, upload, verify, done, fail. No markdown or commentary."""
 
 
 class _DecisionPayload(BaseModel):

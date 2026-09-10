@@ -240,14 +240,15 @@ class PageExtractor:
 
         inputs = []
 
-        for element in self._surface().locator("input").all():
+        for element in self._surface().locator("input, textarea, select").all():
 
             try:
                 inputs.append({
-                    "type": element.get_attribute("type"),
+                    "type": element.evaluate("e => e.tagName === 'SELECT' ? 'select' : e.type"),
                     "name": element.get_attribute("name"),
                     "placeholder": element.get_attribute("placeholder"),
-                    "id": element.get_attribute("id")
+                    "id": element.get_attribute("id"),
+                    "label": element.evaluate("e => Array.from(e.labels || []).map(l => l.innerText).join(' ')")
                 })
             except:
                 continue

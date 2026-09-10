@@ -32,7 +32,7 @@ def run_task(
     *,
     start_url: str,
     task: str,
-    max_steps: int = 40,
+    max_steps: int = 80,
     on_event: EventCallback | None = None,
     guidance=None,
     hitl_wait_seconds: int = 180,

@@ -52,6 +52,8 @@ class AppMapBuilder:
                             "type": str(item.get("type") or ""),
                             "name": str(item.get("name") or ""),
                             "placeholder": str(item.get("placeholder") or ""),
+                            "id": str(item.get("id") or ""),
+                            "label": str(item.get("label") or ""),
                         }
                         if field not in page["fields"]:
                             page["fields"].append(field)
@@ -105,13 +107,15 @@ class AppMapBuilder:
                 lines.append(f"  Clickable: {', '.join(labels[:MAX_ACTIONS_PER_PAGE])}")
             fields = [fill["field"] for fill in page.get("fills", [])]
             for item in page.get("fields", []):
-                descriptor = item.get("placeholder") or item.get("name")
+                descriptor = item.get("id") or item.get("name") or item.get("label") or item.get("placeholder")
                 if descriptor and item.get("type"):
                     descriptor = f"{descriptor} (type={item['type']})"
                 elif not descriptor:
                     descriptor = f"unlabeled input (type={item.get('type') or 'text'})"
                 if descriptor not in fields:
                     fields.append(descriptor)
+                if item.get("id") and (item.get("label") or item.get("placeholder")):
+                    fields.append(f"label for {item['id']}: {item.get('label') or item.get('placeholder')}")
             if fields:
                 lines.append(f"  Form fields: {', '.join(fields)}")
         for transition in app_map.get("transitions", [])[:20]:

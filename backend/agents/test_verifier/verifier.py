@@ -91,7 +91,7 @@ class TestVerifier:
                 if control:
                     controls.setdefault(_normalise(control), control)
             for field in page.get("fields", []):
-                for key in ("placeholder", "name"):
+                for key in ("placeholder", "name", "id", "label"):
                     value = field.get(key)
                     if value:
                         fields.setdefault(_normalise(value), value)
@@ -111,7 +111,7 @@ class TestVerifier:
             target = step.get("target", "")
             if step_type in TARGET_STEP_TYPES:
                 known = controls
-            elif step_type == "fill":
+            elif step_type in ("fill", "check", "upload"):
                 # A fill may legitimately target a field or a labelled control.
                 known = {**fields, **controls}
             else:
@@ -145,7 +145,7 @@ class TestVerifier:
 
     def _verify_expectations(self, case: dict, controls: dict[str, str],
                              fields: dict[str, str]) -> tuple[list[dict], list[dict]]:
-        """Drop element expectations naming controls nobody has ever observed."""
+        """Flag unseen expectations, but never weaken a test by deleting them."""
         known = {**controls, **fields}
         kept, problems = [], []
         for expectation in case.get("expected", []):
@@ -160,6 +160,7 @@ class TestVerifier:
                     "target": expectation["value"],
                     "reason": f"expected control {expectation['value']!r} was never observed",
                 })
+                kept.append(expectation)
                 continue
             kept.append({**expectation, "value": resolved})
         if not kept:
@@ -175,10 +176,12 @@ class TestVerifier:
             return None, False
         if normalised in known:
             return known[normalised], False
-        # Observed labels often carry extra text ("Onboarded Vendors 35").
-        for key, original in known.items():
-            if normalised in key or key in normalised:
-                return original, original.casefold() != normalised
+        # Do not choose the first of several similarly named business controls.
+        matches = [original for key, original in known.items() if normalised in key or key in normalised]
+        if len(matches) > 1:
+            return None, False
+        if len(matches) == 1:
+            return matches[0], matches[0].casefold() != normalised
         # Same identifying words, different decoration: "View X details" ↔ "X 35".
         target_tokens = _tokens(target)
         if target_tokens:

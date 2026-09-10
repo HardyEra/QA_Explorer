@@ -293,39 +293,37 @@ class BrowserController:
                 result.append(info)
         return result
 
-    def click_text(self, text, exact=False):
-        """Click an element by its visible text, searching every frame.
-
-        This is the reliable fallback when action extraction misses a control
-        (iframes, portals, custom widgets): exactly how a human describes the
-        click. Tries text match first, then button/link roles by name.
-        """
-        text = str(text or "").strip()
-        if not text:
-            return False
-        for frame in self._all_frames():
-            try:
-                locator = frame.get_by_text(text, exact=exact).first
-                locator.wait_for(state="visible", timeout=1_500)
-                with self._browser_action("click_text", text):
-                    locator.click(timeout=3_000)
-                self.wait_for_page_ready()
-                return True
-            except (Error, TimeoutError):
-                continue
-        for frame in self._all_frames():
-            for role in ("button", "link"):
+    def _run_control(self, operation, *args):
+        from browser_controls import BrowserControls
+        self.last_control_error = ""
+        try:
+            with self._browser_action(operation, str(args[0]) if args else ""):
                 try:
-                    locator = frame.get_by_role(role, name=text).first
-                    locator.wait_for(state="visible", timeout=1_000)
-                    with self._browser_action("click_text", text):
-                        locator.click(timeout=3_000)
-                    self.wait_for_page_ready()
-                    return True
-                except (Error, TimeoutError):
-                    continue
-        logger.warning("click_text found no visible element with text: %s", text)
-        return False
+                    getattr(BrowserControls(self.page), operation)(*args)
+                except Exception as exc:
+                    from browser_controls import ControlError
+                    if isinstance(exc, ControlError):
+                        raise
+                    # A Playwright fill exception may embed the typed password.
+                    raise ControlError(f"{operation} failed: {type(exc).__name__}") from None
+            return True
+        except Exception as exc:
+            # Do not include Playwright call logs: fill errors can contain secrets.
+            from browser_controls import ControlError
+            self.last_control_error = str(exc) if isinstance(exc, ControlError) else type(exc).__name__
+            return False
+
+    def click_text(self, text, exact=True):
+        return self._run_control("click", text)
+
+    def set_checkbox(self, target, checked=True):
+        return self._run_control("check", target, checked)
+
+    def select_control(self, target, option):
+        return self._run_control("select", target, option)
+
+    def upload_target(self, target, path):
+        return self._run_control("upload", target, path)
 
     def find_otp_boxes(self):
         """Locate a row of 4–8 single-character inputs (an OTP widget)."""
@@ -438,7 +436,8 @@ class BrowserController:
                         self._dom_fingerprint(),
                     )
                 )
-                if count and content_changed:
+                visible_count = sum(interactive.nth(i).is_visible() for i in range(count))
+                if visible_count and content_changed and not self._spinner_visible():
                     logger.info("Found %s interactive elements.", count)
                     if wait_for_content_update:
                         return self._wait_for_destination_content_update(
@@ -554,99 +553,11 @@ class BrowserController:
             return False
 
     def fill_input(self, target, value):
-        """Fill a field by label/placeholder/name/id, searching every frame.
-
-        The main frame is tried first with the full strategy list; child
-        frames follow (login modals live there).  Inside a child frame a
-        final blind fallback fills the first visible text-like input — auth
-        iframes routinely expose a single input with no attributes at all.
-        """
-        for frame in self._all_frames():
-            in_child_frame = frame != self.page.main_frame
-            if self._fill_input_in_frame(frame, target, value, allow_blind=in_child_frame):
-                return True
-
-        self.observability.record_exception(
-            RuntimeError(f"No fillable input matched: {target}"),
-            input={"action": "fill", "selector": target, "page_url": self.page.url},
-            context={
-                "current_url": self.page.url,
-                "workflow_name": self.workflow_name,
-                "active_action": target,
-                "screenshot_path": self.latest_screenshot_path,
-            },
-        )
-        print(f"Couldn't find input: {target}")
-        return False
-
-    def _fill_input_in_frame(self, frame, target, value, allow_blind=False):
-        strategies = [
-            lambda: frame.get_by_placeholder(target),
-            lambda: frame.locator(f'[name="{target}"]'),
-            lambda: frame.locator(f'#{target}'),
-            lambda: frame.get_by_label(target),
-            lambda: frame.locator(f'[aria-label="{target}"]'),
-            # Case-insensitive attribute matches: planners and designers often
-            # capitalise a field name ("Email") that the DOM stores lowercase.
-            lambda: frame.locator(f'[name="{target}" i]'),
-            lambda: frame.locator(f'[id="{target}" i]'),
-            lambda: frame.locator(f'[aria-label="{target}" i]'),
-        ]
-        # Semantic fallbacks by intent: custom login forms frequently expose no
-        # label, name, or placeholder at all, but their input types are still
-        # unambiguous. "username"/"email"/"password" targets must reach them.
-        intent = str(target or "").casefold()
-        if "password" in intent:
-            strategies.append(lambda: frame.locator('input[type="password"]'))
-        if any(term in intent for term in ("email", "e-mail", "username", "user name", "login id", "userid")):
-            strategies.append(lambda: frame.locator('input[type="email"]'))
-            strategies.append(lambda: frame.locator('input[autocomplete="username"]'))
-            strategies.append(lambda: frame.locator('form input[type="text"]'))
-        if allow_blind:
-            strategies.append(lambda: frame.locator(
-                "input:not([type=hidden]):not([type=checkbox]):not([type=radio])"
-                ":not([type=submit]):not([type=button]), textarea"
-            ))
-
-        for strategy in strategies:
-            # Resolve quietly first: a strategy miss is normal, only a failed
-            # fill on a found element is worth recording.
-            try:
-                locator = strategy().first
-                locator.wait_for(state="visible", timeout=500)
-            except Exception:
-                continue
-            try:
-                with self._browser_action("fill", target):
-                    locator.fill(value)
-                return True
-            except Exception:
-                continue
-        return False
+        return self._run_control("fill", target, value)
 
     def upload_file_inputs(self, file_path):
-        """Set a stored test asset on every HTML file input on the page."""
-        file_inputs = self.page.locator('input[type="file"]')
-        try:
-            count = file_inputs.count()
-        except Error as exc:
-            logger.warning("Could not inspect file inputs: %s", exc)
-            return False
-
-        if not count:
-            return False
-
-        uploaded = False
-        for index in range(count):
-            input_locator = file_inputs.nth(index)
-            try:
-                with self._browser_action("upload_file", str(file_path)):
-                    input_locator.set_input_files(str(file_path))
-                logger.info("Uploaded test asset %s to file input %s", file_path, index)
-                uploaded = True
-            except (Error, TimeoutError) as exc:
-                logger.warning("Failed to upload test asset to file input %s: %s", index, exc)
-        return uploaded
+        """Upload only when exactly one file input is present."""
+        return self.upload_target("", file_path)
 
     def upload_file_action(self, action_id, file_path):
         """Attach a file to the exact file input selected by the planner."""

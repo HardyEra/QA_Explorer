@@ -47,6 +47,7 @@ class BrowserTools:
         name = decision.action_type
         handler = getattr(self, f"_tool_{name}", None)
         notes: list[str] = []
+        error = ""
         with self.observability.span(
             f"tool:{name}",
             input={
@@ -63,6 +64,7 @@ class BrowserTools:
                     metadata={"action_type": name}, level="WARNING",
                 )
                 success = False
+                error = f"Unsupported action: {name}"
             else:
                 try:
                     success = bool(handler(decision, notes))
@@ -71,13 +73,16 @@ class BrowserTools:
                         exc, context={"active_action": f"tool:{name}"}
                     )
                     success = False
-            span.update(output={"success": success, "notes": notes})
-        return {"success": success, "notes": notes}
+                    error = type(exc).__name__
+            if not success and not error:
+                error = getattr(self.browser, "last_control_error", "") or "Action did not establish its requested state"
+            span.update(output={"success": success, "notes": notes, "error": error})
+        return {"success": success, "notes": notes, "error": error}
 
     @staticmethod
     def _safe_value(decision: TaskDecision) -> str:
         # OTP codes are secrets the human just typed; keep them out of traces.
-        return "***" if decision.action_type == "enter_otp" else decision.value
+        return "***" if decision.action_type in ("enter_otp", "fill") else decision.value
 
     # ------------------------------------------------------------- tools
 
@@ -98,6 +103,44 @@ class BrowserTools:
 
     def _tool_fill(self, decision: TaskDecision, notes: list[str]) -> bool:
         return bool(self.browser.fill_input(decision.target, decision.value))
+
+    def _tool_select(self, decision: TaskDecision, notes: list[str]) -> bool:
+        return self.browser.select_control(decision.target, decision.value)
+
+    def _tool_check(self, decision: TaskDecision, notes: list[str]) -> bool:
+        if decision.value not in ("true", "false"):
+            notes.append("check requires true or false")
+            return False
+        return self.browser.set_checkbox(decision.target, decision.value == "true")
+
+    def _tool_upload(self, decision: TaskDecision, notes: list[str]) -> bool:
+        from asset_manager import AssetManager
+        path = AssetManager().list_assets().get(decision.value)
+        if path is None:
+            notes.append("Requested asset is unavailable; ask for it instead of substituting a different file")
+            return False
+        return self.browser.upload_target(decision.target, path)
+
+    @staticmethod
+    def verification_spec(decision):
+        kind, _, target = decision.target.partition(":")
+        return {"type": kind, "target": target, "value": decision.value}
+
+    def _tool_verify(self, decision: TaskDecision, notes: list[str]) -> bool:
+        from browser_controls import check_expectation
+        from time import monotonic
+        deadline = monotonic() + 10
+        while True:
+            if check_expectation(self.browser.page, self.verification_spec(decision)):
+                return True
+            if monotonic() >= deadline:
+                notes.append("The requested outcome was not observed; inspect the page before retrying any submit")
+                return False
+            self.browser.wait_for_timeout(250)
+
+    def _tool_done(self, decision: TaskDecision, notes: list[str]) -> bool:
+        notes.append("Completion rejected: verify the business outcome first, after the last state-changing action")
+        return False
 
     def _tool_click_at(self, decision: TaskDecision, notes: list[str]) -> bool:
         x, y = decision.x, decision.y

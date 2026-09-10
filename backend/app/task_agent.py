@@ -21,6 +21,7 @@ payment-looking click go through the guidance channel, never guessed.
 
 from __future__ import annotations
 
+import json
 import operator
 import os
 from pathlib import Path
@@ -43,6 +44,13 @@ MAX_HISTORY_LINES = 14
 MIN_TRUSTED_DOM_ACTIONS = 4
 
 SYSTEM_RULES = """RULES
+- Follow the user's business dependencies in order (e.g. create client before vendor). Reuse earlier answers and approved demo data. Do not invent a valid tax identity, an OTP, or an official document.
+- Read LIVE FORM STATE on every page: unique ids, current values, validation errors, checkbox state, and uploaded filenames. Repeated labels must be targeted by unique id. Confirm prefilled drafts match the intended record.
+- A successful click is not proof of navigation, saving, or task completion. Observe destination content and server validation before advancing. If a submit was clicked, inspect success messages or the resulting record before considering another submit.
+- "select": target is the dropdown's label/id, value is its exact option text. "check": target is the checkbox label/id, value is "true" or "false". "upload": target is the exact file input label/id, value is a key from STORED ASSETS. Never substitute an unrelated asset.
+- "verify": target is text_visible, element_visible, url_contains, field_value:<unique field id>, or checked:<unique field id>; value is the expected text/value (true/false for checked). Verify contact auto-fill, important field values and selected options before continuing.
+- Before "done", perform a successful verify of the business outcome after the last change. For record creation, verify the uniquely named record in the destination list/detail page; a reset form or changed URL alone is insufficient. Completion requires evidence, not your summary.
+- Re-observe after failures and use the error details to change approach. Never blindly repeat a submit or click a different field just because its label is similar.
 - Return exactly ONE decision for the single next browser action.
 - Prefer clicking listed elements via action_type "click" with their action_id.
 - "click_text" (value = the exact visible text) clicks any element by its text, searching the page AND every iframe. Use it for anything under IFRAME ELEMENTS, and as the fallback whenever the element you need is not in the action list. Login/signup/payment widgets usually live inside iframes — their controls only appear under IFRAME ELEMENTS and are only reachable with click_text or fill.
@@ -91,7 +99,7 @@ class TaskAgent:
     """Drive one BrowserController through a natural-language task."""
 
     def __init__(self, browser, planner: GeminiTaskPlanner, goal: str,
-                 max_steps: int = 40, guidance=None,
+                 max_steps: int = 80, guidance=None,
                  on_event: Callable[[dict[str, Any]], None] | None = None,
                  ask_timeout_s: int = 180, observability=None):
         from observability.tracing import NoopObservability
@@ -227,6 +235,10 @@ class TaskAgent:
                     break
         except Exception:
             pass
+        from browser_controls import page_evidence
+        context["live"] = page_evidence(self.browser.page) if self.browser.page else []
+        from asset_manager import AssetManager
+        context["assets"] = list(AssetManager().list_assets())
         return context
 
     def _needs_vision(self, state: TaskState) -> bool:
@@ -266,8 +278,10 @@ class TaskAgent:
 
     def _route_after_plan(self, state: TaskState) -> str:
         decision = state.get("decision")
-        if decision is None or decision.action_type in ("done", "fail"):
+        if decision is None or decision.action_type == "fail":
             return "finalize"
+        if decision.action_type == "done":
+            return "finalize" if self._completion_verified(state) else "act"
         # Honour one "look" per step: analyze, then replan with the image.
         if decision.action_type == "look" and not state.get("vision"):
             return "vision"
@@ -282,6 +296,9 @@ class TaskAgent:
             "step": state.get("step", 0),
             "description": decision.describe(),
             "reasoning": decision.reasoning,
+            "action_type": decision.action_type,
+            "error": result.get("error", ""),
+            "verification": self.tools.verification_spec(decision) if decision.action_type == "verify" else None,
             "success": result["success"],
             "url": self._current_url(),
         }
@@ -290,6 +307,20 @@ class TaskAgent:
             f"→ {'ok' if result['success'] else 'FAILED'}"
         )
         return {"history": [entry], "human_notes": result["notes"]}
+
+    def _completion_verified(self, state):
+        from browser_controls import check_expectation
+        for entry in reversed(state.get("history", [])):
+            kind = entry.get("action_type")
+            if kind == "verify":
+                if not entry.get("success"):
+                    return False
+                spec = entry.get("verification") or {}
+                # A URL alone does not establish the business outcome.
+                return spec.get("type") != "url_contains" and check_expectation(self.browser.page, spec)
+            if kind not in ("look", "wait", "ask_human", "verify", "done"):
+                return False
+        return False
 
     # -------------------------------------------------------------- finalize
 
@@ -300,7 +331,7 @@ class TaskAgent:
         elif state.get("planner_failed"):
             status = "error"
             summary = "The planning model is unavailable or kept returning invalid decisions."
-        elif decision is not None and decision.action_type == "done":
+        elif decision is not None and decision.action_type == "done" and self._completion_verified(state):
             status, summary = "done", decision.value or "Task completed."
         elif decision is not None and decision.action_type == "fail":
             status, summary = "failed", decision.value or "Task reported as impossible."
@@ -312,6 +343,9 @@ class TaskAgent:
             "summary": summary,
             "steps": min(state.get("step", 0), self.max_steps),
             "history": state.get("history", []),
+            "verification": next((entry.get("verification") for entry in reversed(state.get("history", []))
+                                  if entry.get("action_type") == "verify" and entry.get("success")), None)
+                            if status == "done" else None,
         }
         self.observability.event(
             name="task_outcome",
@@ -332,6 +366,8 @@ class TaskAgent:
             f"\nTASK: {self.goal}",
             f"\nCURRENT PAGE\nURL: {self._current_url()}",
         ]
+        parts.append("\nLIVE FORM STATE AND PAGE TEXT\n" + json.dumps(context.get("live", []), ensure_ascii=False))
+        parts.append("\nSTORED ASSETS: " + ", ".join(context.get("assets", [])))
         if context.get("app_wall"):
             parts.append(
                 f'\nWARNING: the page says "{context["app_wall"]}" — this part of the goal '
@@ -386,7 +422,7 @@ class TaskAgent:
         if history:
             parts.append("\nRECENT STEPS (oldest first)")
             parts.extend(
-                f"{entry['step']}. {entry['description']} → {'ok' if entry['success'] else 'FAILED'}"
+                f"{entry['step']}. {entry['description']} → {'ok' if entry['success'] else 'FAILED'} {entry.get('error', '')}"
                 for entry in history[-MAX_HISTORY_LINES:]
             )
         notes = state.get("human_notes", [])

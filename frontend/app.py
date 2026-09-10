@@ -574,7 +574,7 @@ with form_col:
                 username = st.text_input("Username", placeholder="name@example.com")
                 password = st.text_input("Password", type="password")
         with steps_col:
-            max_steps = st.number_input("Exploration depth", min_value=1, max_value=500, value=30, step=5, help="Maximum actions the agent may take.")
+            max_steps = st.number_input("Action limit" if task_mode else "Exploration depth", min_value=1, max_value=500, value=80 if task_mode else 30, step=5, help="Maximum actions the agent may take, including verification and recovery.")
         exploration_goal = st.text_area(
             "What should the agent accomplish?",
             placeholder="Example: Log in with my email (ask me for the OTP), set the location to my area, "
