@@ -14,7 +14,7 @@ MODEL_TIMEOUT_MS = int(os.getenv("MODEL_TIMEOUT_MS", "10000"))
 # for the test-design phase, which runs last and needs the strongest model.
 PLANNER_MODEL = (
     os.getenv("GROQ_EXPLORER_MODEL")
-    or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 )
 PLANNER_TEMPERATURE = 0
 BUSINESS_WORKFLOW_CATEGORIES = {
