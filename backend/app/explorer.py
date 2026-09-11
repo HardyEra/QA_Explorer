@@ -38,7 +38,8 @@ class ExplorationState(TypedDict, total=False):
 class Explorer:
     """Explore an application through an explicit LangGraph state machine."""
 
-    def __init__(self, browser, config, observability, on_event: Callable[[dict[str, Any]], None] | None = None):
+    def __init__(self, browser, config, observability, on_event: Callable[[dict[str, Any]], None] | None = None,
+                 guidance=None):
         self.browser = browser
         self.config = config
         self.observability = observability
@@ -56,6 +57,10 @@ class Explorer:
         self.action_classifier = ActionClassifier()
         self.action_ranker = ActionRanker()
         self.on_event = on_event or (lambda event: None)
+        # Live tester guidance: drained before every plan; the agent may also
+        # ask a question and wait when it has no viable next action.
+        self.guidance = guidance
+        self.live_guidance: list[str] = []
         self.browser.set_new_tab_policy(config.explore_new_tabs)
         self.browser.set_navigation_policy(config.start_url, config.follow_external)
         self.graph = self._build_graph()
@@ -138,6 +143,13 @@ class Explorer:
             " ".join(str(getattr(action, "text", "")).split())
             for action in observation.actions[:20]
         ]
+        # Control roles let the Designer distinguish a dropdown from a text
+        # field and a checkbox from a button — fill vs select vs click.
+        control_roles = {
+            " ".join(str(getattr(action, "text", "")).split()): str(getattr(action, "type", ""))
+            for action in observation.actions[:20]
+            if getattr(action, "type", "") in {"combobox", "checkbox", "radio", "menuitem", "file_upload"}
+        }
         observed_inputs = [
             {
                 "type": str(item.get("type") or ""),
@@ -154,6 +166,7 @@ class Explorer:
                 "page_title": observation.page.title,
                 "url": observation.page.url,
                 "controls": [control for control in observed_controls if control],
+                "control_roles": control_roles,
                 "inputs": observed_inputs,
                 "timestamp": self._timestamp(),
             }
@@ -320,6 +333,38 @@ class Explorer:
             logger.info("%s. %s (%s)", position, action.text, action.priority)
         return {"planner_candidates": candidates}
 
+    def _absorb_guidance(self) -> None:
+        """Pick up anything the tester typed since the last planning step."""
+        if self.guidance is None:
+            return
+        for message in self.guidance.drain():
+            self.live_guidance.append(message)
+            logger.info("Applying live tester guidance: %s", message)
+            self.on_event({"type": "status", "status": f"Tester guidance received: {message[:80]}"})
+        self.config.live_guidance = list(self.live_guidance)
+
+    def _ask_tester_when_stuck(self, observation) -> bool:
+        """Ask the tester for direction; returns True when a reply arrived."""
+        if self.guidance is None or self.config.hitl_wait_seconds <= 0:
+            return False
+        labels = ", ".join(
+            str(getattr(action, "text", "")) for action in observation.actions[:8]
+        )
+        question = (
+            f"I'm stuck on {observation.page.url} — I don't see a safe next action. "
+            f"Controls I can see: {labels or 'none'}. "
+            f"What should I do? (I'll wait {self.config.hitl_wait_seconds}s)"
+        )
+        self.on_event({"type": "agent_question", "status": f"🤖 {question}"})
+        reply = self.guidance.ask(question, self.config.hitl_wait_seconds)
+        if not reply:
+            self.on_event({"type": "status", "status": "No tester reply — continuing autonomously"})
+            return False
+        self.live_guidance.append(reply)
+        self.config.live_guidance = list(self.live_guidance)
+        self.on_event({"type": "status", "status": "Tester replied — replanning with guidance"})
+        return True
+
     @traced_node("Planner")
     def _plan(self, state: ExplorationState) -> dict[str, Any]:
         # The planner receives only the highest-ranked, unexplored actions.
@@ -332,12 +377,20 @@ class Explorer:
             actions=state["planner_candidates"],
             available_actions=state["planner_candidates"],
         )
+        self._absorb_guidance()
         plan = self.planner.plan(
             observation,
             self.memory.visited_pages,
             self.memory.executed_actions,
             self.config,
         )
+        if not plan.get("steps") and self._ask_tester_when_stuck(observation):
+            plan = self.planner.plan(
+                observation,
+                self.memory.visited_pages,
+                self.memory.executed_actions,
+                self.config,
+            )
         logger.info("Planner returned %s steps", len(plan.get("steps", [])))
         self.on_event({"type": "status", "status": "Executing plan", "url": observation.page.url})
         print(plan)

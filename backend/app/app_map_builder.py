@@ -31,7 +31,7 @@ class AppMapBuilder:
             page = pages.setdefault(
                 url,
                 {"url": url, "title": str(event.get("page_title") or ""), "actions": [],
-                 "fills": [], "controls": [], "fields": []},
+                 "fills": [], "controls": [], "fields": [], "roles": {}},
             )
             if event.get("page_title") and not page["title"]:
                 page["title"] = str(event["page_title"])
@@ -43,12 +43,17 @@ class AppMapBuilder:
                     label = str(control).strip()
                     if label and label not in page["controls"] and len(page["controls"]) < MAX_ACTIONS_PER_PAGE:
                         page["controls"].append(label)
+                for label, role in (event.get("control_roles") or {}).items():
+                    if label and role:
+                        page.setdefault("roles", {})[str(label)] = str(role)
                 for item in event.get("inputs") or []:
                     if isinstance(item, dict):
                         field = {
                             "type": str(item.get("type") or ""),
                             "name": str(item.get("name") or ""),
                             "placeholder": str(item.get("placeholder") or ""),
+                            "id": str(item.get("id") or ""),
+                            "label": str(item.get("label") or ""),
                         }
                         if field not in page["fields"]:
                             page["fields"].append(field)
@@ -84,24 +89,33 @@ class AppMapBuilder:
     @staticmethod
     def compact_text(app_map: dict[str, Any], max_pages: int = 15) -> str:
         """Serialize the map for a prompt without flooding the context."""
+        role_tags = {"combobox": "[dropdown]", "checkbox": "[checkbox]", "radio": "[radio]",
+                     "file_upload": "[file upload]", "menuitem": "[menu item]"}
         lines = [f"Start URL: {app_map.get('start_url', '')}"]
         for page in app_map.get("pages", [])[:max_pages]:
             lines.append(f"- Page: {page.get('title') or '(untitled)'} | {page.get('url')}")
+            roles = page.get("roles", {})
             labels = [action["label"] for action in page.get("actions", [])]
             for control in page.get("controls", []):
                 if control not in labels:
                     labels.append(control)
+            labels = [
+                f"{label} {role_tags[roles[label]]}" if roles.get(label) in role_tags else label
+                for label in labels
+            ]
             if labels:
                 lines.append(f"  Clickable: {', '.join(labels[:MAX_ACTIONS_PER_PAGE])}")
             fields = [fill["field"] for fill in page.get("fills", [])]
             for item in page.get("fields", []):
-                descriptor = item.get("placeholder") or item.get("name")
+                descriptor = item.get("id") or item.get("name") or item.get("label") or item.get("placeholder")
                 if descriptor and item.get("type"):
                     descriptor = f"{descriptor} (type={item['type']})"
                 elif not descriptor:
                     descriptor = f"unlabeled input (type={item.get('type') or 'text'})"
                 if descriptor not in fields:
                     fields.append(descriptor)
+                if item.get("id") and (item.get("label") or item.get("placeholder")):
+                    fields.append(f"label for {item['id']}: {item.get('label') or item.get('placeholder')}")
             if fields:
                 lines.append(f"  Form fields: {', '.join(fields)}")
         for transition in app_map.get("transitions", [])[:20]:

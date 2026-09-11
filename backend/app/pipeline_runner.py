@@ -24,6 +24,7 @@ for _path in (_BACKEND_ROOT, _BACKEND_ROOT / "app"):
 
 from logging_config import configure_logging  # noqa: E402
 from observability.langfuse_client import create_observability  # noqa: E402
+from observability.tracing import TraceMetadata  # noqa: E402
 from runner import EventLogHandler  # noqa: E402
 
 from graphs.orchestrator_graph import PipelineState, QAOrchestrator  # noqa: E402
@@ -238,6 +239,9 @@ def run_pipeline(
     preserve_session: bool = False,
     max_concurrency: int = 3,
     resume_run_id: str | None = None,
+    hitl_wait_seconds: int = 0,
+    show_browser: bool = False,
+    guidance=None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run ingest → explore → map → design → critique → execute → report."""
@@ -258,6 +262,16 @@ def run_pipeline(
             + "\nTester feedback remembered from earlier runs (authoritative corrections):\n"
             + feedback
         )
+    from decision_evaluation import load_decision_guidance
+
+    decision_guidance = load_decision_guidance()
+    if decision_guidance:
+        logger.info("Applying learned agent-decision guidance")
+        application_context = (
+            application_context.strip()
+            + "\nLessons from earlier agent decision evaluations (apply when relevant):\n"
+            + decision_guidance
+        )
 
     callback({"type": "started", "run_id": run_id, "status": "Pipeline starting",
               "docs": len(doc_paths), "url": start_url})
@@ -273,6 +287,8 @@ def run_pipeline(
         "max_steps": max_steps,
         "skip_exploration": skip_exploration,
         "preserve_session": preserve_session,
+        "hitl_wait_seconds": hitl_wait_seconds,
+        "execution_headless": not show_browser,
         "doc_paths": doc_paths,
         # Tester-written requirements and cases join every run alongside the
         # document/exploration-derived ones.
@@ -287,16 +303,40 @@ def run_pipeline(
 
     llm_client.reset_model_health()
     orchestrator = QAOrchestrator(
-        observability, on_event=callback, checkpointer=_create_checkpointer()
+        observability, on_event=callback, checkpointer=_create_checkpointer(),
+        guidance=guidance,
     )
     try:
-        final_state = orchestrator.invoke(
-            state,
-            max_concurrency=max_concurrency,
-            thread_id=run_id,
-            resume=bool(resume_run_id),
-        )
-        final_state = dict(final_state)
+        with observability.trace(
+            "QA Pipeline Run",
+            metadata=TraceMetadata(
+                project_name="qa-explorer", session_id=run_id, exploration_id=run_id,
+                current_page=start_url, current_goal=goal or "Autonomous QA pipeline",
+            ),
+            input={"start_url": start_url, "goal": goal, "max_steps": max_steps},
+        ) as trace:
+            final_state = orchestrator.invoke(
+                state,
+                max_concurrency=max_concurrency,
+                thread_id=run_id,
+                resume=bool(resume_run_id),
+            )
+            final_state = dict(final_state)
+            from decision_evaluation import evaluate_run, persist_evaluation
+
+            evaluation = evaluate_run(final_state)
+            final_state["decision_evaluation"] = evaluation
+            trace.update(output={"summary": final_state.get("report", {}).get("summary", {}),
+                                 "evaluation": evaluation})
+            for name, value in evaluation["scores"].items():
+                observability.score_current_trace(
+                    name, value, comment=evaluation["comment"], metadata=evaluation["metadata"],
+                )
+            observability.score_current_trace(
+                "agent_decision_outcome", evaluation["outcome"], data_type="CATEGORICAL",
+                comment=evaluation["comment"], metadata=evaluation["metadata"],
+            )
+            persist_evaluation(evaluation)
         report = final_state.get("report", {})
         health = llm_client.model_health()
         if health["failures"]:

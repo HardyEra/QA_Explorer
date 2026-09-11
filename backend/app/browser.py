@@ -5,6 +5,7 @@ from playwright.sync_api import Error, TimeoutError
 import logging
 from difflib import SequenceMatcher
 from hashlib import sha256
+from pathlib import Path
 from urllib.parse import urlparse
 from contextlib import contextmanager
 from time import monotonic, perf_counter
@@ -28,6 +29,8 @@ class BrowserController:
         self.observability = NoopObservability()
         self.latest_screenshot_path = None
         self.workflow_name = None
+        # Set only by start_persistent(); owns browser shutdown when present.
+        self._persistent_context = None
 
     def start(self, observability=None, headless=False, storage_state=None):
         self.observability = observability or NoopObservability()
@@ -53,6 +56,37 @@ class BrowserController:
             self.page,
             self.action_registry
         )
+
+    def start_persistent(self, user_data_dir, observability=None, headless=False,
+                         channel="chrome", viewport=(1280, 800)):
+        """Launch a persistent real-Chrome profile instead of a fresh Chromium.
+
+        Cookies, logins, and OTP verifications survive between runs, and
+        consumer sites' bot detection sees an ordinary installed browser.
+        Falls back to the bundled Chromium when Chrome is not installed.
+        """
+        self.observability = observability or NoopObservability()
+        self.playwright = sync_playwright().start()
+        Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+        launch_kwargs = dict(
+            user_data_dir=str(user_data_dir),
+            headless=headless,
+            viewport={"width": viewport[0], "height": viewport[1]},
+        )
+        try:
+            context = self.playwright.chromium.launch_persistent_context(
+                channel=channel, **launch_kwargs
+            )
+        except Error as exc:
+            logger.warning("Chrome channel '%s' unavailable (%s); using bundled Chromium",
+                           channel, exc)
+            context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        self._persistent_context = context
+        self.browser = context.browser
+        self.page = context.pages[0] if context.pages else context.new_page()
+        self.page.context.on("page", self._handle_new_page)
+        self.action_registry = ActionRegistry()
+        self.extractor = PageExtractor(self.page, self.action_registry)
 
     @contextmanager
     def _browser_action(self, action, selector=None):
@@ -159,7 +193,14 @@ class BrowserController:
         self.page.context.storage_state(path=str(path))
 
     def close(self):
-        if self.browser:
+        if self._persistent_context is not None:
+            # Closing the persistent context shuts down its browser process.
+            try:
+                self._persistent_context.close()
+            except Error as exc:
+                logger.warning("Could not close the persistent context: %s", exc)
+            self._persistent_context = None
+        elif self.browser:
             self.browser.close()
         if self.playwright:
             self.playwright.stop()
@@ -173,6 +214,166 @@ class BrowserController:
         with self._browser_action("select", selector):
             self.page.locator(selector).select_option(value)
         self.wait_for_page_ready()
+
+    def click_at(self, x_px, y_px):
+        """Click a raw viewport coordinate — for canvas/visually-rendered UI."""
+        with self._browser_action("click_at", f"{x_px},{y_px}"):
+            self.page.mouse.click(x_px, y_px)
+        self.wait_for_page_ready()
+
+    # ------------------------------------------------------------------
+    # Frame-aware interaction.  Consumer sites mount login and payment UI
+    # in child iframes (e.g. Zomato's auth-login-ui on accounts.zomato.com);
+    # main-frame-only extraction sees an empty page there and the agent
+    # starves.  Everything below searches the main frame first, then every
+    # attached child frame.
+    # ------------------------------------------------------------------
+
+    def _candidate_frames(self, limit=6):
+        frames = []
+        for frame in self.page.frames:
+            if frame == self.page.main_frame:
+                continue
+            try:
+                if frame.is_detached() or not frame.url:
+                    continue
+            except Error:
+                continue
+            frames.append(frame)
+            if len(frames) >= limit:
+                break
+        return frames
+
+    def _all_frames(self):
+        return [self.page.main_frame, *self._candidate_frames()]
+
+    def frame_elements(self, max_per_frame=40):
+        """Visible clickable texts and inputs inside child iframes.
+
+        Returns [{name, url, clickables: [str], inputs: [{type, placeholder,
+        name, maxlength}]}] for frames that contain anything interactive.
+        """
+        result = []
+        for frame in self._candidate_frames():
+            info = {"name": frame.name or "", "url": frame.url[:120],
+                    "clickables": [], "inputs": []}
+            try:
+                clickable = frame.locator(
+                    "button, [role='button'], a, input[type='submit']"
+                )
+                seen = set()
+                for index in range(min(clickable.count(), max_per_frame)):
+                    element = clickable.nth(index)
+                    try:
+                        if not element.is_visible():
+                            continue
+                        text = " ".join((element.inner_text(timeout=200) or "").split())[:60]
+                        if text and text.casefold() not in seen:
+                            seen.add(text.casefold())
+                            info["clickables"].append(text)
+                    except Error:
+                        continue
+                inputs = frame.locator("input, textarea")
+                for index in range(min(inputs.count(), 15)):
+                    element = inputs.nth(index)
+                    try:
+                        if not element.is_visible():
+                            continue
+                        info["inputs"].append({
+                            "type": element.get_attribute("type") or "text",
+                            "placeholder": element.get_attribute("placeholder") or "",
+                            "name": element.get_attribute("name") or "",
+                            "maxlength": element.get_attribute("maxlength") or "",
+                        })
+                    except Error:
+                        continue
+            except Error as exc:
+                logger.debug("Could not inspect frame %s: %s", frame.name, exc)
+            if info["clickables"] or info["inputs"]:
+                result.append(info)
+        return result
+
+    def _run_control(self, operation, *args):
+        from browser_controls import BrowserControls
+        self.last_control_error = ""
+        try:
+            with self._browser_action(operation, str(args[0]) if args else ""):
+                try:
+                    getattr(BrowserControls(self.page), operation)(*args)
+                except Exception as exc:
+                    from browser_controls import ControlError
+                    if isinstance(exc, ControlError):
+                        raise
+                    # A Playwright fill exception may embed the typed password.
+                    raise ControlError(f"{operation} failed: {type(exc).__name__}") from None
+            return True
+        except Exception as exc:
+            # Do not include Playwright call logs: fill errors can contain secrets.
+            from browser_controls import ControlError
+            self.last_control_error = str(exc) if isinstance(exc, ControlError) else type(exc).__name__
+            return False
+
+    def click_text(self, text, exact=True):
+        return self._run_control("click", text)
+
+    def set_checkbox(self, target, checked=True):
+        return self._run_control("check", target, checked)
+
+    def select_control(self, target, option):
+        return self._run_control("select", target, option)
+
+    def upload_target(self, target, path):
+        return self._run_control("upload", target, path)
+
+    def find_otp_boxes(self):
+        """Locate a row of 4–8 single-character inputs (an OTP widget)."""
+        for frame in self._all_frames():
+            try:
+                boxes = frame.locator("input[maxlength='1']")
+                if 4 <= boxes.count() <= 8:
+                    return boxes
+            except Error:
+                continue
+        return None
+
+    def fill_otp(self, code):
+        """Type a one-time code into split OTP boxes.
+
+        Split-box widgets auto-advance focus per keystroke, so the reliable
+        input method is: click the first box, then send real key events —
+        a locator ``fill`` puts the whole code in one box and fails.
+        """
+        code = str(code or "").strip().replace(" ", "")
+        if not code:
+            return False
+        boxes = self.find_otp_boxes()
+        if boxes is not None:
+            with self._browser_action("fill_otp", f"{len(code)} chars"):
+                boxes.first.click()
+                self.page.keyboard.type(code, delay=120)
+            return True
+        # No maxlength markers: fall back to the first visible input of a
+        # child frame (auth modals are usually the only frame present).
+        for frame in self._candidate_frames():
+            try:
+                first = frame.locator("input").first
+                first.wait_for(state="visible", timeout=1_000)
+                with self._browser_action("fill_otp", f"{len(code)} chars (frame fallback)"):
+                    first.click()
+                    self.page.keyboard.type(code, delay=120)
+                return True
+            except (Error, TimeoutError):
+                continue
+        logger.warning("fill_otp could not locate OTP inputs")
+        return False
+
+    def press_key(self, key):
+        with self._browser_action("press_key", key):
+            self.page.keyboard.press(key)
+
+    def scroll(self, delta_y):
+        with self._browser_action("scroll", str(delta_y)):
+            self.page.mouse.wheel(0, delta_y)
 
     def wait_for_timeout(self, timeout_ms):
         with self._browser_action("wait", selector=f"timeout:{timeout_ms}ms"):
@@ -235,7 +436,8 @@ class BrowserController:
                         self._dom_fingerprint(),
                     )
                 )
-                if count and content_changed:
+                visible_count = sum(interactive.nth(i).is_visible() for i in range(count))
+                if visible_count and content_changed and not self._spinner_visible():
                     logger.info("Found %s interactive elements.", count)
                     if wait_for_content_update:
                         return self._wait_for_destination_content_update(
@@ -351,76 +553,11 @@ class BrowserController:
             return False
 
     def fill_input(self, target, value):
-
-        strategies = [
-            lambda: self.page.get_by_placeholder(target),
-            lambda: self.page.locator(f'[name="{target}"]'),
-            lambda: self.page.locator(f'#{target}'),
-            lambda: self.page.get_by_label(target),
-            lambda: self.page.locator(f'[aria-label="{target}"]'),
-            # Case-insensitive attribute matches: planners and designers often
-            # capitalise a field name ("Email") that the DOM stores lowercase.
-            lambda: self.page.locator(f'[name="{target}" i]'),
-            lambda: self.page.locator(f'[id="{target}" i]'),
-            lambda: self.page.locator(f'[aria-label="{target}" i]'),
-        ]
-        # Semantic fallbacks by intent: custom login forms frequently expose no
-        # label, name, or placeholder at all, but their input types are still
-        # unambiguous. "username"/"email"/"password" targets must reach them.
-        intent = str(target or "").casefold()
-        if "password" in intent:
-            strategies.append(lambda: self.page.locator('input[type="password"]'))
-        if any(term in intent for term in ("email", "e-mail", "username", "user name", "login id", "userid")):
-            strategies.append(lambda: self.page.locator('input[type="email"]'))
-            strategies.append(lambda: self.page.locator('input[autocomplete="username"]'))
-            strategies.append(lambda: self.page.locator('form input[type="text"]'))
-
-        for strategy in strategies:
-            try:
-                with self._browser_action("fill", target):
-                    locator = strategy()
-                    locator.first.wait_for(state="visible", timeout=500)
-                    locator.first.fill(value)
-                return True
-            except Exception as exc:
-                self.observability.record_exception(
-                    exc,
-                    input={"action": "fill", "selector": target, "page_url": self.page.url},
-                    context={
-                    "current_url": self.page.url,
-                    "workflow_name": self.workflow_name,
-                    "active_action": target,
-                        "screenshot_path": self.latest_screenshot_path,
-                    },
-                )
-                pass
-
-        print(f"Couldn't find input: {target}")
-        return False
+        return self._run_control("fill", target, value)
 
     def upload_file_inputs(self, file_path):
-        """Set a stored test asset on every HTML file input on the page."""
-        file_inputs = self.page.locator('input[type="file"]')
-        try:
-            count = file_inputs.count()
-        except Error as exc:
-            logger.warning("Could not inspect file inputs: %s", exc)
-            return False
-
-        if not count:
-            return False
-
-        uploaded = False
-        for index in range(count):
-            input_locator = file_inputs.nth(index)
-            try:
-                with self._browser_action("upload_file", str(file_path)):
-                    input_locator.set_input_files(str(file_path))
-                logger.info("Uploaded test asset %s to file input %s", file_path, index)
-                uploaded = True
-            except (Error, TimeoutError) as exc:
-                logger.warning("Failed to upload test asset to file input %s: %s", index, exc)
-        return uploaded
+        """Upload only when exactly one file input is present."""
+        return self.upload_target("", file_path)
 
     def upload_file_action(self, action_id, file_path):
         """Attach a file to the exact file input selected by the planner."""

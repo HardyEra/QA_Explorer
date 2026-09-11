@@ -76,6 +76,18 @@ Allowed step types (the runner is deterministic, no other types exist):
 - {{"type": "fill", "target": "<field placeholder/name/label>", "value": "<text>"}}
 - {{"type": "upload", "target": "<visible label of the upload control, or empty>",
    "value": "<asset name from the list below>"}}
+- {{"type": "select", "target": "<label of the dropdown>", "value": "<visible text of the option to choose>"}}
+- {{"type": "check", "target": "<unique checkbox id or label>", "value": "true"}}
+- {{"type": "assert", "expectation": {{"type": "field_value", "target": "<unique input id>", "value": "<expected value>"}}}}
+CHECKPOINT RULE: use assert steps between wizard pages and before submitting.
+Verify autofilled contact values and checkbox state. Use unique field ids where
+labels repeat. Include prerequisite business setup inside the test; do not rely
+on another test creating a client or vendor. Use user-provided valid test IDs
+and listed assets; do not invent official identities or documents. For record
+creation, navigate to the resulting list/detail and verify the specific record;
+a reset form or generic Submit button is not evidence of creation.
+DROPDOWN RULE: a control marked [dropdown] in the map, or a field shown as
+(type=select), is NOT typeable — use a "select" step for it, never "fill".
 Stored test assets available for upload steps: {assets_note}
 Design an upload step ONLY when the application map shows a file input or an
 upload control (e.g. "Choose Files", "Upload"), and only with a listed asset.
@@ -86,14 +98,33 @@ input type. Use the exact form-field names from the application map when
 present. For unlabeled login fields, use the target "email" (or "username")
 and "password" — the runner resolves those by input type.
 
+Allowed expectation types (also valid in assert checkpoints):
+- {{"type": "field_value", "target": "<unique input id>", "value": "<expected value>"}}
+- {{"type": "checked", "target": "<unique checkbox id>", "value": "true"}}
 Allowed expectation types (checked after the final step):
-- {{"type": "url_contains", "value": "<substring of the expected URL>"}}
 - {{"type": "text_visible", "value": "<text expected on the page>"}}
-- {{"type": "element_visible", "value": "<visible label of an expected control>"}}
+- {{"type": "element_visible", "value": "<label of an expected control>"}}
+- {{"type": "url_contains", "value": "<substring of an OBSERVED URL>"}}
+
+VERIFY FUNCTIONALITY, NOT URLs. What matters is that the feature works — that
+the destination screen really shows its controls and content. So:
+- Every case MUST assert at least one text_visible or element_visible check
+  naming something the application map actually lists for the destination page
+  (e.g. after opening Candidates, assert the candidate list's own controls).
+- Use url_contains only as a supporting check, and only with a URL fragment
+  that appears in the map. NEVER invent a path, and never rely on a bare
+  domain check — "the page is still on the site" proves nothing.
+- Exception: for negative flows where staying put IS the expected behaviour
+  (e.g. invalid login), asserting the current page's URL fragment is correct.
+
 GROUNDING RULE: text_visible and element_visible values must be copied verbatim
 from the application map or from the requirements (e.g. a documented error
-message). If you do not know the exact UI text, assert url_contains instead —
-never guess interface copy.
+message). Never guess interface copy.
+
+NAVIGATE LIKE A USER: use a navigate step only for the application's start URL
+(and the login page). Reach every other screen by clicking the application's
+own navigation controls, exactly as a human tester would — deep-linking to a
+guessed URL is not a test of the feature.
 
 Return exactly one JSON object:
 {{
@@ -294,51 +325,44 @@ class TestDesigner:
 
     @staticmethod
     def _ground_case(case: dict, corpus: str, start_url: str) -> dict:
-        """Drop expectations nothing observed or documented supports.
-
-        This includes URLs: models invent URL schemes ("slide-1") that no
-        observed page ever had, producing false failures.
-        """
+        """Retain outcome assertions; unknown map coverage is not disproof."""
         domain = (urlparse(start_url).netloc or start_url).casefold()
-        grounded = []
-        for expectation in case.get("expected", []):
-            value = expectation["value"].casefold()
-            if expectation["type"] == "url_contains":
-                if value in corpus or domain in value or value in start_url.casefold():
-                    grounded.append(expectation)
-                else:
-                    logger.info(
-                        "Dropped ungrounded URL expectation %r from case %s",
-                        expectation["value"], case.get("id"),
-                    )
-                continue
-            if value in corpus:
-                grounded.append(expectation)
-            else:
-                logger.info(
-                    "Dropped ungrounded expectation %r from case %s",
-                    expectation["value"], case.get("id"),
-                )
-        if not grounded:
-            # A case must still verify something: at minimum the run stayed on
-            # the application rather than an error page.
-            grounded = [{"type": "url_contains", "value": urlparse(start_url).netloc or start_url}]
-        return {**case, "expected": grounded}
+        expected = list(case.get("expected", []))
+        functional = any(item["type"] != "url_contains" for item in expected)
+        if functional:
+            expected = [item for item in expected if not (
+                item["type"] == "url_contains" and item["value"].casefold().strip("/") == domain
+            )]
+        unseen = [f"Outcome not yet observed in the map: {item['value']}"
+                  for item in expected if item["type"] not in ("field_value", "checked")
+                  and item["value"].casefold() not in corpus]
+        return {**case, "expected": expected, "unverified": list(case.get("unverified", [])) + unseen}
 
     @staticmethod
     def _fallback(feature: str, requirements: list[dict], app_map: dict, start_url: str) -> list[dict]:
         """One deterministic smoke case per requirement (or one for the app).
 
-        Assertions stay URL-based on purpose: a page's tab title is often not
-        rendered as visible text, so asserting it produces false failures.
+        Each asserts the destination page's own observed controls — proof the
+        feature actually rendered, not merely that the server answered. A page
+        title is never asserted: tab titles are rarely visible page text.
         """
         domain = urlparse(start_url).netloc or start_url
 
+        pages_by_url = {page.get("url"): page for page in app_map.get("pages", [])}
+
         def smoke(case_id: str, requirement: dict | None) -> dict:
-            # Assert only that the application answered: a deeper page may
-            # redirect to login, which is not a failure of reachability.
+            # Functional check: the page must actually render its own observed
+            # controls. A bare domain check proves nothing and is the last
+            # resort only when nothing was ever observed for that page.
             target_url = (requirement or {}).get("source_url") or start_url
-            expected = [{"type": "url_contains", "value": domain}]
+            page = pages_by_url.get(target_url, {})
+            controls = [
+                control for control in page.get("controls", [])
+                if control and len(control) > 2
+            ][:3]
+            expected = [{"type": "element_visible", "value": control} for control in controls]
+            if not expected:
+                expected = [{"type": "url_contains", "value": domain}]
             case = {
                 "id": case_id,
                 "requirement_id": (requirement or {}).get("id", ""),

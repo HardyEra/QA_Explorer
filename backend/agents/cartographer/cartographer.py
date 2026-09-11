@@ -234,14 +234,16 @@ class Cartographer:
         """One reachability requirement per observed page."""
         requirements = []
         for index, page in enumerate(app_map.get("pages", []), start=1):
-            title = page.get("title") or page.get("url", "")
-            controls = ", ".join(page.get("controls", [])[:10])
+            controls = page.get("controls", [])[:10]
+            # Name the requirement after what the screen DOES, using its own
+            # controls — URLs and tab titles are not product functionality.
+            feature = (controls[0] if controls else page.get("title") or "page").casefold()
             requirements.append(
                 {
                     "id": f"app-R{index}",
-                    "feature": (page.get("title") or "page").casefold(),
-                    "title": f"Page '{title}' is reachable and renders its controls",
-                    "description": f"Observed controls: {controls}" if controls else "",
+                    "feature": feature,
+                    "title": f"The {feature} screen opens and shows its controls",
+                    "description": f"Observed controls: {', '.join(controls)}" if controls else "",
                     "acceptance_criteria": [],
                     "priority": "medium",
                     "source_doc": "observed application",

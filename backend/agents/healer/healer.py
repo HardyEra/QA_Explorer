@@ -83,7 +83,12 @@ class Healer:
             and str(revised.get("target") or "").strip()
         ):
             revised_step = {"type": step["type"], "target": str(revised["target"]).strip()}
-            if step["type"] == "fill":
-                revised_step["value"] = str(revised.get("value", step.get("value", "")))
+            # Healing repairs identity only, never data or expected outcomes.
+            observed = snapshot.get("controls", []) + snapshot.get("fields", [])
+            if revised_step["target"] not in observed or step["type"] in ("navigate", "assert"):
+                return {"decision": "bug", "reason": "Repair target was not observed or step cannot be healed"}
+            for key, value in step.items():
+                if key not in ("type", "target"):
+                    revised_step[key] = value
             return {"decision": "retry", "revised_step": revised_step, "reason": reason}
         return {"decision": "bug", "reason": reason}

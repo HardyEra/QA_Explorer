@@ -21,6 +21,7 @@ for path in (BACKEND_ROOT, BACKEND_APP):
         sys.path.insert(0, str(path))
 
 from asset_manager import AssetManager  # noqa: E402
+from guidance import GuidanceChannel  # noqa: E402
 from pipeline_runner import (  # noqa: E402
     add_custom_requirement,
     add_custom_test_case,
@@ -31,6 +32,7 @@ from pipeline_runner import (  # noqa: E402
     save_feedback,
 )
 from runner import run_exploration  # noqa: E402
+from task_runner import run_task  # noqa: E402
 
 
 st.set_page_config(page_title="Sentinel-QA", page_icon="🛡️", layout="wide", initial_sidebar_state="collapsed")
@@ -153,36 +155,37 @@ def is_valid_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def start_run(inputs: dict[str, object]) -> tuple[threading.Thread, queue.Queue]:
-    events: queue.Queue = queue.Queue()
+def start_active_run(kind: str, inputs: dict[str, object], run_label: str) -> None:
+    """Launch a run in a background thread; the page stays interactive.
 
-    def worker() -> None:
-        try:
-            run_exploration(on_event=events.put, **inputs)
-        except Exception:
-            # The runner emits a user-safe failure event before raising.
-            pass
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    return thread, events
-
-
-def start_pipeline_run(inputs: dict[str, object]) -> tuple[threading.Thread, queue.Queue, dict]:
-    """Run the multi-agent pipeline off the UI thread; the holder carries its result."""
+    Everything the console needs across Streamlit reruns lives in
+    ``st.session_state``, including the two-way guidance channel that powers
+    the live chat with the agent.
+    """
+    channel = GuidanceChannel()
     events: queue.Queue = queue.Queue()
     holder: dict = {}
 
     def worker() -> None:
         try:
-            holder["state"] = run_pipeline(on_event=events.put, **inputs)
+            if kind == "pipeline":
+                holder["state"] = run_pipeline(on_event=events.put, guidance=channel, **inputs)
+            elif kind == "task":
+                holder["state"] = run_task(on_event=events.put, guidance=channel, **inputs)
+            else:
+                run_exploration(on_event=events.put, guidance=channel, **inputs)
         except Exception:
-            # The pipeline emits a user-safe failure event before raising.
+            # All runners emit a user-safe failure event before raising.
             pass
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    return thread, events, holder
+    st.session_state.update(
+        run_active=True, run_kind=kind, run_label=run_label, run_worker=thread,
+        run_events=events, run_holder=holder, run_channel=channel,
+        run_logs=[], run_status="Starting…", run_url=str(inputs.get("start_url", "")),
+        run_shot=None, run_count=0, run_current_test=None, run_results=[],
+    )
 
 
 def save_uploaded_docs(files) -> list[str]:
@@ -254,70 +257,155 @@ def save_uploaded_assets(asset_manager: AssetManager) -> None:
             st.session_state.pop("asset_error", None)
 
 
-def render_run_console(worker: threading.Thread, events: queue.Queue, initial_url: str, mode: str,
-                       run_label: str = "Exploration") -> None:
-    status = "Preparing secure browser session"
-    current_url = initial_url
-    logs: list[str] = []
-    latest_screenshot: str | None = None
-    event_count = 0
+def render_execution_panel() -> None:
+    """Live test-execution view: what is running now and what has finished."""
+    current = st.session_state.get("run_current_test")
+    results = st.session_state.get("run_results") or []
+    if not current and not results:
+        return
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Test execution</p>', unsafe_allow_html=True)
+    passed = sum(1 for item in results if item["Status"] == "passed")
+    finished = len(results)
+    st.markdown(
+        f'<p class="panel-subtitle">{finished} finished · {passed} passed · '
+        f'{finished - passed} failed</p>',
+        unsafe_allow_html=True,
+    )
+
+    if current:
+        total = current.get("total_steps") or 0
+        index = current.get("index") or 0
+        st.markdown(
+            f'<p class="status-label">Running now</p>'
+            f'<p class="status-value">▶ {current.get("title", "")}</p>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f'Step {index}/{total}: {current.get("step", "")}')
+        if total:
+            st.progress(min(1.0, index / total))
+
+    if results:
+        st.dataframe(results, use_container_width=True, hide_index=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_active_run() -> None:
+    """Non-blocking live console: refreshes ~1×/s, chat stays interactive."""
+    worker: threading.Thread = st.session_state["run_worker"]
+    events: queue.Queue = st.session_state["run_events"]
+    channel: GuidanceChannel = st.session_state["run_channel"]
+    run_label = st.session_state["run_label"]
+
+    # Fold any new backend events into the accumulated console state.
+    while True:
+        try:
+            event = events.get_nowait()
+        except queue.Empty:
+            break
+        st.session_state["run_count"] += 1
+        if event.get("status"):
+            st.session_state["run_status"] = event["status"]
+        if event.get("url"):
+            st.session_state["run_url"] = event["url"]
+
+        event_type = event.get("type")
+        if event_type == "test_start":
+            st.session_state["run_current_test"] = {
+                "title": event.get("title", ""),
+                "test_id": event.get("test_id", ""),
+                "total_steps": event.get("total_steps", 0),
+                "step": "starting…",
+                "index": 0,
+            }
+        elif event_type == "test_step":
+            current = st.session_state.get("run_current_test") or {}
+            current.update(step=event.get("description", ""), index=event.get("index", 0),
+                           total_steps=event.get("total", current.get("total_steps", 0)))
+            st.session_state["run_current_test"] = current
+        elif event_type == "test_result":
+            st.session_state.setdefault("run_results", []).append({
+                "Test": event.get("title", ""),
+                "Status": event.get("result_status", ""),
+                "Seconds": round((event.get("duration_ms") or 0) / 1000, 1),
+                "Reason": (event.get("reason") or "")[:90],
+            })
+            st.session_state["run_current_test"] = None
+        if event.get("type") == "log":
+            logs = st.session_state["run_logs"]
+            logs.append(event["message"])
+            st.session_state["run_logs"] = logs[-80:]
+            phase_status = pipeline_status_from_log(event["message"])
+            if phase_status:
+                st.session_state["run_status"] = phase_status
+        screenshot_path = event.get("screenshot_path")
+        if screenshot_path and Path(screenshot_path).exists():
+            # Read and validate immediately; keep the previous good frame if
+            # the file is mid-write (PNG magic header check).
+            try:
+                data = Path(screenshot_path).read_bytes()
+                if data.startswith(b"\x89PNG") and len(data) > 1_000:
+                    st.session_state["run_shot"] = data
+            except OSError:
+                pass
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown(f'<p class="panel-title">Live {run_label.lower()}</p>', unsafe_allow_html=True)
-    st.markdown('<p class="panel-subtitle">Keep this page open while the agents work on the application.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="panel-subtitle">Watch the browser window; guide the agent below whenever it gets something wrong.</p>', unsafe_allow_html=True)
     metric_a, metric_b, metric_c = st.columns(3)
-    mode_metric = metric_a.empty()
-    activity_metric = metric_b.empty()
-    connection_metric = metric_c.empty()
-    status_box = st.empty()
-    url_box = st.empty()
-    progress_box = st.empty()
+    metric_a.metric("Run", run_label)
+    metric_b.metric("Activity", f'{st.session_state["run_count"]} events')
+    metric_c.metric("Connection", "Running" if worker.is_alive() else "Finishing")
+    st.markdown(
+        f'<p class="status-label">Current activity</p><p class="status-value">{st.session_state["run_status"]}</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f'Current page: {st.session_state["run_url"]}')
+    st.progress(min(0.94, 0.08 + st.session_state["run_count"] * 0.02), text=f"{run_label} is in progress")
     visual_col, activity_col = st.columns([1.25, 1])
     with visual_col:
-        screenshot_box = st.empty()
+        if st.session_state["run_shot"]:
+            try:
+                st.image(st.session_state["run_shot"], caption="Latest browser state",
+                         use_container_width=True)
+            except Exception:
+                st.info("Browser preview refreshing…")
+        else:
+            st.info("A browser preview will appear after the first page observation.")
     with activity_col:
-        log_box = st.empty()
-
-    while worker.is_alive() or not events.empty():
-        try:
-            event = events.get(timeout=0.25)
-        except queue.Empty:
-            event = None
-
-        if event:
-            event_count += 1
-            status = event.get("status", status)
-            current_url = event.get("url", current_url)
-            if event.get("type") == "log":
-                logs.append(event["message"])
-                logs = logs[-80:]
-                phase_status = pipeline_status_from_log(event["message"])
-                if phase_status:
-                    status = phase_status
-            screenshot_path = event.get("screenshot_path")
-            if screenshot_path and Path(screenshot_path).exists():
-                latest_screenshot = screenshot_path
-
-        mode_metric.metric("Mode", "Goal driven" if mode.startswith("Goal") else "Discovery")
-        activity_metric.metric("Activity", f"{event_count} events")
-        connection_metric.metric("Connection", "Running" if worker.is_alive() else "Finishing")
-        status_box.markdown(f'<p class="status-label">Current activity</p><p class="status-value">{status}</p>', unsafe_allow_html=True)
-        url_box.caption(f"Current page: {current_url}")
-        progress_box.progress(min(0.94, 0.08 + event_count * 0.025), text=f"{run_label} is in progress")
-        with visual_col:
-            if latest_screenshot:
-                screenshot_box.image(latest_screenshot, caption="Latest browser state", use_container_width=True)
-            else:
-                screenshot_box.info("A browser preview will appear after the first page observation.")
-        with activity_col:
-            log_box.code("\n".join(logs[-18:]) or "Waiting for activity…", language=None)
-
-    progress_box.progress(1.0, text=f"{run_label} finished")
-    if "failed" in status.casefold():
-        st.error(status)
-    else:
-        st.success(status)
+        st.code("\n".join(st.session_state["run_logs"][-18:]) or "Waiting for activity…", language=None)
     st.markdown("</div>", unsafe_allow_html=True)
+
+    render_execution_panel()
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Guide the agent</p><p class="panel-subtitle">Your messages are injected into the agent’s next planning step, and it may ask you questions when stuck.</p>', unsafe_allow_html=True)
+    for who, text in list(channel.transcript):
+        with st.chat_message("assistant" if who == "agent" else "user"):
+            st.write(text)
+    if channel.pending_question:
+        st.warning("🤖 The agent is waiting for your answer — reply below.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    message = st.chat_input("e.g. “Client Name is a dropdown — click it and pick an option, don’t type”")
+    if message:
+        channel.send(message)
+        st.rerun()
+
+    if worker.is_alive() or not events.empty():
+        time.sleep(1.0)
+        st.rerun()
+
+    # Run finished: hand off to the normal page (report renders there).
+    st.session_state["run_active"] = False
+    if st.session_state["run_kind"] == "pipeline":
+        report = (st.session_state["run_holder"].get("state") or {}).get("report")
+        if report:
+            st.session_state["pipeline_report"] = report
+        else:
+            st.session_state.pop("pipeline_report", None)
+            st.session_state["run_failed_no_report"] = True
+    st.rerun()
 
 
 def render_pipeline_report(report: dict) -> None:
@@ -455,19 +543,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if st.session_state.get("run_active"):
+    render_active_run()
+    st.stop()
+
+if st.session_state.pop("run_failed_no_report", False):
+    st.warning("The pipeline did not produce a report. Check the activity log of the last run for the failure.")
+
 form_col, guide_col = st.columns([1.55, 1], gap="large")
 with form_col:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown('<p class="panel-title">New run</p><p class="panel-subtitle">Start with a URL, then add only the context the agents need.</p>', unsafe_allow_html=True)
     run_mode = st.radio(
         "Run mode",
-        ["Full QA pipeline", "Exploration only"],
+        ["Full QA pipeline", "Exploration only", "Browser task"],
         horizontal=True,
         help="The full pipeline analyses your docs, explores the app, designs and executes "
              "test cases in parallel, and produces a QA report. Exploration only runs the "
-             "original discovery agent.",
+             "original discovery agent. Browser task completes one real-world goal for you "
+             "(e.g. “order a biryani from the nearest restaurant”) in a visible Chrome "
+             "window, asking you in the chat for OTPs and payment confirmations.",
     )
     pipeline_mode = run_mode == "Full QA pipeline"
+    task_mode = run_mode == "Browser task"
     with st.form("exploration_form", clear_on_submit=False):
         website_url = st.text_input("Target URL", placeholder="https://app.example.com", help="The application entry point to explore.")
         credentials_col, steps_col = st.columns([1.5, 1])
@@ -476,8 +574,15 @@ with form_col:
                 username = st.text_input("Username", placeholder="name@example.com")
                 password = st.text_input("Password", type="password")
         with steps_col:
-            max_steps = st.number_input("Exploration depth", min_value=1, max_value=500, value=30, step=5, help="Maximum actions the agent may take.")
-        exploration_goal = st.text_area("What should the agent accomplish?", placeholder="Example: Open Candidates, find Nicole, update the candidate name to Max, save, then log out.", height=110)
+            max_steps = st.number_input("Action limit" if task_mode else "Exploration depth", min_value=1, max_value=500, value=80 if task_mode else 30, step=5, help="Maximum actions the agent may take, including verification and recovery.")
+        exploration_goal = st.text_area(
+            "What should the agent accomplish?",
+            placeholder="Example: Log in with my email (ask me for the OTP), set the location to my area, "
+                        "and add a chicken biryani from the nearest restaurant to the cart."
+                        if task_mode else
+                        "Example: Open Candidates, find Nicole, update the candidate name to Max, save, then log out.",
+            height=110,
+        )
         application_context = st.text_area("Application context (optional)", placeholder="Important roles, rules, modules, or areas to prioritise and avoid.", height=80)
         if pipeline_mode:
             uploaded_docs = st.file_uploader(
@@ -504,8 +609,20 @@ with form_col:
                          "test that uses the real credentials (~15–20s faster per test). "
                          "Invalid-login tests still run fresh and logged out.",
                 )
+                show_browser = st.checkbox(
+                    "Show the browser while running tests",
+                    value=False,
+                    help="Runs each test in a visible Chrome window, like a Playwright headed "
+                         "run. Easier to watch; slightly slower.",
+                )
+                ask_when_stuck = st.checkbox(
+                    "Agent may ask me when stuck (waits 120s)",
+                    value=True,
+                    help="During exploration, if the agent finds no safe next action it asks "
+                         "you in the chat and waits up to 120 seconds for your reply.",
+                )
         submitted = st.form_submit_button(
-            "Start QA pipeline" if pipeline_mode else "Start exploration",
+            "Start QA pipeline" if pipeline_mode else ("Start browser task" if task_mode else "Start exploration"),
             type="primary",
             use_container_width=True,
         )
@@ -630,17 +747,23 @@ if submitted:
             "skip_exploration": bool(skip_exploration),
             "preserve_session": bool(preserve_session),
             "max_concurrency": int(workers),
+            "hitl_wait_seconds": 120 if ask_when_stuck else 0,
+            "show_browser": bool(show_browser),
         }
-        st.write("")
-        worker, events, holder = start_pipeline_run(pipeline_inputs)
-        render_run_console(worker, events, website_url.strip(), "Goal Driven Exploration",
-                           run_label="QA pipeline")
-        report = (holder.get("state") or {}).get("report")
-        if report:
-            st.session_state["pipeline_report"] = report
+        start_active_run("pipeline", pipeline_inputs, "QA pipeline")
+        st.rerun()
+    elif task_mode:
+        if not exploration_goal.strip():
+            st.error("Describe the task the agent should complete (e.g. what to order and from where).")
         else:
-            st.session_state.pop("pipeline_report", None)
-            st.warning("The pipeline did not produce a report. Check the activity log above for the failure.")
+            task_inputs = {
+                "start_url": website_url.strip(),
+                "task": exploration_goal.strip(),
+                "max_steps": int(max_steps),
+                "hitl_wait_seconds": 180,
+            }
+            start_active_run("task", task_inputs, "Browser task")
+            st.rerun()
     else:
         run_inputs = {
             "start_url": website_url.strip(),
@@ -649,11 +772,10 @@ if submitted:
             "application_context": application_context,
             "exploration_goal": exploration_goal,
             "max_steps": int(max_steps),
+            "hitl_wait_seconds": 120,
         }
-        mode = "Goal Driven Exploration" if exploration_goal.strip() else "Autonomous Discovery"
-        st.write("")
-        worker, events = start_run(run_inputs)
-        render_run_console(worker, events, website_url.strip(), mode)
+        start_active_run("exploration", run_inputs, "Exploration")
+        st.rerun()
 
 if st.session_state.get("pipeline_report"):
     st.write("")
